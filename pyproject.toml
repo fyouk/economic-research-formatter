@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "economic-research-formatter"
+version = "0.1.0"
+description = "Rule-driven DOCX linter and safe formatter for Economic Research manuscripts"
+requires-python = ">=3.10"
+dependencies = [
+  "PyYAML>=6.0",
+]
+
+[project.scripts]
+er-format = "economic_research_formatter.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

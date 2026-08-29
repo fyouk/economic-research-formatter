@@ -1,0 +1,222 @@
+version: 1
+rules:
+  - id: ER-CIT-GENERAL-001
+    domain: citation
+    target: literature_citation
+    normativity: mandatory
+    source:
+      source_id: ER-REF-GUIDE
+      source_type: explicit_instruction
+      locator: "一/（一）基本方法"
+      evidence: "不作注释(无论是脚注还是尾注)，而是在引用处加一括号"
+    requirement:
+      use_footnote_for_literature_reference: false
+      placement: inline_parenthetical
+    lint: {severity: error}
+    autofix: never
+
+  - id: ER-CIT-GENERAL-002
+    domain: citation
+    target: parenthetical_citation_fields
+    normativity: mandatory
+    source:
+      source_id: ER-REF-GUIDE
+      source_type: explicit_instruction
+      locator: "一/（一）基本方法"
+      evidence: "作者姓名；出版年份；如有必要，注明页码"
+    requirement:
+      required: [author, year]
+      conditional: [page]
+      year_month_included: false
+    lint: {severity: error}
+    autofix: never
+
+  - id: ER-CIT-NARRATIVE-001
+    domain: citation
+    target: narrative_citation
+    normativity: mandatory
+    source:
+      source_id: ER-REF-GUIDE
+      source_type: explicit_instruction
+      locator: "一/（一）/（2）"
+      evidence: "张三(1990)"
+    requirement:
+      when_author_in_sentence: parenthetical_year_only
+    lint: {severity: error}
+    autofix: conditional
+
+  - id: ER-CIT-SELF-001
+    domain: citation
+    target: self_citation
+    normativity: mandatory
+    source:
+      source_id: ER-REF-GUIDE
+      source_type: explicit_instruction
+      locator: "一/（一）/（3）"
+      evidence: "作者引用自己的文章，也需注明人名"
+    requirement:
+      author_name_required: true
+    lint: {severity: error}
+    autofix: never
+
+  - id: ER-CIT-TITLE-IN-SENTENCE-001
+    domain: citation
+    target: narrative_citation_with_author_and_title
+    normativity: mandatory
+    source:
+      source_id: ER-REF-GUIDE
+      source_type: explicit_instruction
+      locator: "一/（一）/（4）"
+      evidence: "正文中若直接出现作者姓名和文章标题，可只注出版年份及必要的页码"
+    requirement:
+      parenthetical_fields: [year]
+      conditional_fields: [page]
+    lint: {severity: error}
+    autofix: never
+
+  - id: ER-CIT-MULTI-AUTHORSOURCES-001
+    domain: citation
+    target: multiple_sources_different_authors
+    normativity: mandatory
+    source:
+      source_id: ER-REF-GUIDE
+      source_type: explicit_instruction
+      locator: "一/（一）/（5）"
+      evidence: "不同作者的文章用分号分开"
+    requirement:
+      separator: "；"
+    lint: {severity: error}
+    autofix: conditional
+
+  - id: ER-CIT-SAMEAUTHOR-MULTIYEAR-001
+    domain: citation
+    target: multiple_sources_same_author
+    normativity: mandatory
+    source:
+      source_id: ER-REF-GUIDE
+      source_type: explicit_instruction
+      locator: "一/（一）/（6）"
+      evidence: "(1987，1988a，1988b，1990)"
+    requirement:
+      author_once: true
+      year_separator: "，"
+      same_year_suffix_supported: true
+    lint: {severity: error}
+    autofix: conditional
+
+  - id: ER-CIT-TRANSLATION-001
+    domain: citation
+    target: chinese_translation_citation
+    normativity: mandatory
+    source:
+      source_id: ER-REF-GUIDE
+      source_type: explicit_instruction
+      locator: "一/（二）/（1）"
+      evidence: "作者的中译名；中译本的出版年份；必要的页码"
+    requirement:
+      author_form: chinese_translated_name
+      year_basis: chinese_translation_edition
+      conditional_fields: [page]
+    lint: {severity: error}
+    autofix: never
+
+  - id: ER-CIT-FOREIGN-ORIGINAL-001
+    domain: citation
+    target: foreign_original_citation
+    normativity: mandatory
+    source:
+      source_id: ER-REF-GUIDE
+      source_type: explicit_instruction
+      locator: "一/（二）/（2）"
+      evidence: "直接注原文人名，不必翻译(人名一般只注姓)"
+    requirement:
+      translate_author_name: false
+      author_name_form: surname_usually
+    lint: {severity: error}
+    autofix: never
+
+  - id: ER-CIT-MIXEDLANG-001
+    domain: citation
+    target: mixed_chinese_foreign_sources
+    normativity: mandatory
+    source:
+      source_id: ER-REF-GUIDE
+      source_type: explicit_instruction
+      locator: "一/（二）/（3）"
+      evidence: "既有中文文献，又有外文文献，分别注中文与外文"
+    requirement:
+      preserve_language_specific_form: true
+    lint: {severity: error}
+    autofix: never
+
+  - id: ER-CIT-EN-TWOAUTHORS-001
+    domain: citation
+    target: english_two_author_in_text
+    normativity: mandatory
+    source:
+      source_id: ER-MS-IMG-NOTES
+      source_type: red_annotation
+      locator: "附录/图片第1页/批注5"
+      evidence: "两个作者，Ravallian & Chen (2001)"
+    requirement:
+      author_connector: "&"
+    lint: {severity: error}
+    autofix: conditional
+
+  - id: ER-CIT-EN-MULTIAUTHORS-001
+    domain: citation
+    target: english_three_plus_author_in_text
+    normativity: mandatory
+    source:
+      source_id: ER-MS-IMG-NOTES
+      source_type: red_annotation
+      locator: "附录/图片第1页/批注5"
+      evidence: "三个及以上，一般写法：Wang et al. (2013)"
+    requirement:
+      abbreviation: "et al."
+      minimum_authors: 3
+    lint: {severity: error}
+    autofix: conditional
+
+  - id: ER-CIT-ZH-TWOAUTHORS-001
+    domain: citation
+    target: chinese_two_author_in_text
+    normativity: mandatory
+    source:
+      source_id: ER-MS-IMG-NOTES
+      source_type: red_annotation
+      locator: "附录/图片第1页/批注5"
+      evidence: "两个作者，倪***和王*** (2020)"
+    requirement:
+      author_connector: 和
+    lint: {severity: error}
+    autofix: conditional
+
+  - id: ER-CIT-ZH-MULTIAUTHORS-001
+    domain: citation
+    target: chinese_three_plus_author_in_text
+    normativity: mandatory
+    source:
+      source_id: ER-MS-IMG-NOTES
+      source_type: red_annotation
+      locator: "附录/图片第1页/批注5"
+      evidence: "三个以上，一般写法：倪**等 (2020)"
+    requirement:
+      abbreviation: 等
+      minimum_authors: 3
+    lint: {severity: error}
+    autofix: conditional
+
+  - id: ER-CIT-REF-FULLAUTHORS-001
+    domain: citation
+    target: reference_corresponding_to_abbreviated_in_text_citation
+    normativity: mandatory
+    source:
+      source_id: ER-MS-IMG-NOTES
+      source_type: red_annotation
+      locator: "附录/图片第1页/批注5"
+      evidence: "文末列参考文献时需把作者写全和完整"
+    requirement:
+      list_all_authors_in_reference: true
+    lint: {severity: error}
+    autofix: never

@@ -1,0 +1,42 @@
+version: 1
+unknowns:
+  - id: ER-UNKNOWN-001
+    topic: body_chinese_font
+    status: not_specified_in_current_sources
+    source_note: 稿件整理版明确列入“图片中没有明确规定的项目”。
+  - id: ER-UNKNOWN-002
+    topic: body_font_size
+    status: not_specified_in_current_sources
+  - id: ER-UNKNOWN-003
+    topic: page_margins
+    status: not_specified_in_current_sources
+  - id: ER-UNKNOWN-004
+    topic: body_line_spacing
+    status: not_specified_in_current_sources
+  - id: ER-UNKNOWN-005
+    topic: paragraph_spacing_before_after
+    status: not_specified_in_current_sources
+  - id: ER-UNKNOWN-006
+    topic: keyword_font_size
+    status: not_specified_in_current_sources
+  - id: ER-UNKNOWN-007
+    topic: table_caption_font
+    status: not_specified_in_current_sources
+  - id: ER-UNKNOWN-008
+    topic: table_border_style
+    status: not_specified_in_current_sources
+  - id: ER-UNKNOWN-009
+    topic: figure_caption_position
+    status: not_specified_in_current_sources
+  - id: ER-UNKNOWN-010
+    topic: reference_heading_font_size
+    status: not_specified_in_current_sources
+  - id: ER-UNKNOWN-011
+    topic: equation_number_font_and_continuity
+    status: example_present_but_red_annotation_not_explicit
+  - id: ER-UNKNOWN-012
+    topic: ordinary_footnote_marker_must_be_circled_number
+    status: example_present_but_red_annotation_not_explicit
+  - id: ER-UNKNOWN-013
+    topic: table_sequence_title_unit_position
+    status: example_present_but_red_annotation_not_explicit
