@@ -7,6 +7,9 @@ from collections.abc import Mapping, Sequence
 import re
 from typing import Any
 
+from economic_research_formatter.models.notes import iter_note_targets
+from economic_research_formatter.models.numbering import numbering_state as _numbering_state
+
 from .patterns import (
     ABSTRACT_RE,
     CHAPTER_HEADING_RE,
@@ -118,8 +121,14 @@ def _numbering(paragraph: Mapping[str, Any]) -> Mapping[str, Any]:
     return result
 
 
+def _numbering_is_unresolved(numbering: Mapping[str, Any]) -> bool:
+    return bool(numbering) and _numbering_state(numbering) is None
+
+
 def _numbering_level(paragraph: Mapping[str, Any]) -> int | None:
     numbering = _numbering(paragraph)
+    if _numbering_state(numbering) is not True:
+        return None
     for key in ("ilvl", "level", "outline_level"):
         value = numbering.get(key)
         try:
@@ -256,6 +265,7 @@ def _heading_structure(paragraph: Mapping[str, Any]) -> tuple[int | None, list[s
 
     style_level = _style_heading_level(paragraph.get("style_name") or paragraph.get("style"))
     outline_level = _outline_level(paragraph)
+    numbering = _numbering(paragraph)
     numbering_level = _numbering_level(paragraph)
     evidence: list[str] = []
     if style_level is not None:
@@ -264,6 +274,8 @@ def _heading_structure(paragraph: Mapping[str, Any]) -> tuple[int | None, list[s
         evidence.append(f"outline_level={outline_level}")
     if numbering_level is not None:
         evidence.append(f"numbering_ilvl={numbering_level}")
+    elif _numbering_is_unresolved(numbering):
+        evidence.append("unresolved_numbering")
 
     # Word outline levels and numbering ilvls are zero-based.  When both are
     # available they are the strongest independent agreement.  A non-generic
@@ -297,6 +309,8 @@ def _heading_role(text: str, paragraph: Mapping[str, Any]) -> tuple[str | None, 
     if not text.strip():
         return None, [], 0.0
     style_level = _style_heading_level(paragraph.get("style_name") or paragraph.get("style"))
+    outline_level = _outline_level(paragraph)
+    numbering = _numbering(paragraph)
     numbering_level = _numbering_level(paragraph)
     structural_level, structural_evidence = _heading_structure(paragraph)
     if structural_level is not None and structural_level in range(1, 5):
@@ -314,6 +328,22 @@ def _heading_role(text: str, paragraph: Mapping[str, Any]) -> tuple[str | None, 
             visible_role = "heading_level_3"
         elif PAREN_LEVEL_RE.match(text):
             visible_role = "heading_level_4"
+        # The built-in Heading 1 style commonly carries outlineLvl=0 even
+        # when a thesis applies it to every numbered heading.  A visible
+        # decimal depth of 1.1/1.1.1 is stronger semantic evidence than that
+        # generic structural default, so preserve the conflict explicitly and
+        # classify at the visible depth.
+        if (
+            style_level == 1
+            and outline_level == 0
+            and DECIMAL_HEADING_RE.match(text)
+            and visible_role is not None
+            and visible_role != "heading_level_1"
+        ):
+            visible_level = visible_role.rsplit("_", 1)[-1]
+            evidence.append(f"visible_prefix_level={visible_level}")
+            evidence.append(f"style_conflict=generic_heading_1_vs_visible_decimal_depth_{visible_level}")
+            return visible_role, evidence, 0.96
         if visible_role is not None and visible_role != f"heading_level_{structural_level}":
             evidence.append(f"visible_prefix_level={visible_role.rsplit('_', 1)[-1]}")
         return f"heading_level_{structural_level}", evidence, 0.99
@@ -335,6 +365,8 @@ def _heading_role(text: str, paragraph: Mapping[str, Any]) -> tuple[str | None, 
         evidence = ["regex=thesis_style_numbering", f"decimal_depth={level}"]
         if numbering_level is not None:
             evidence.append(f"numbering_ilvl={numbering_level}")
+        elif _numbering_is_unresolved(numbering):
+            evidence.append("unresolved_numbering")
         return f"heading_level_{level}", evidence, 0.94
     if ONE_DOT_HEADING_RE.match(text):
         return "heading_level_3", ["regex=one_dot_heading"], 0.88
@@ -424,11 +456,14 @@ def _classify_paragraphs(inspection: Mapping[str, Any]) -> list[dict[str, Any]]:
             # the paragraph as a reference; this keeps trailing blank/heading
             # paragraphs from becoming phantom entries.
             numbering = _numbering(paragraph)
-            if numbering or paragraph.get("in_reference") or paragraph.get("reference_entry") or is_probable_reference_text(text):
+            numbering_state = _numbering_state(numbering)
+            if numbering_state is True or paragraph.get("in_reference") or paragraph.get("reference_entry") or is_probable_reference_text(text):
                 role, confidence = "reference_entry", 0.98
                 evidence.append("after_reference_heading")
-                if numbering:
+                if numbering_state is True:
                     evidence.append("automatic_numbering")
+                elif numbering_state is None:
+                    evidence.append("unresolved_numbering")
                 if paragraph.get("in_reference") or paragraph.get("reference_entry"):
                     evidence.append("inspector_reference_marker")
             else:
@@ -519,31 +554,18 @@ def _classify_paragraphs(inspection: Mapping[str, Any]) -> list[dict[str, Any]]:
 def _classify_note_items(inspection: Mapping[str, Any]) -> list[dict[str, Any]]:
     """Classify note-part records separately from body paragraphs.
 
-    The Inspector currently exposes note text but not effective formatting.
-    Keeping these records in a separate collection lets the linter attach a
-    review finding to the actual footnote without pretending it is a body
-    paragraph or treating missing formatting as a clean result.
+    Footnotes and endnotes are separate OOXML targets.  Keeping both in a
+    separate collection lets the linter attach findings to the actual note
+    without pretending an endnote is a footnote or treating missing
+    formatting as a clean result.
     """
 
-    notes = inspection.get("notes", {})
-    if not isinstance(notes, Mapping):
-        return []
-    footnotes = notes.get("footnotes", notes)
-    if not isinstance(footnotes, Mapping):
-        return []
-    values = footnotes.get("items")
-    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)) or not values:
-        values = footnotes.get("paragraphs", [])
-    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
-        return []
-
     result: list[dict[str, Any]] = []
-    for index, raw_item in enumerate(values):
-        item = _mapping(raw_item)
-        if not item:
-            continue
-        note_id = item.get("id", index)
-        source_id = str(item.get("source_id") or f"footnote-{note_id}")
+    for index, target in enumerate(iter_note_targets(inspection)):
+        item = target.to_mapping()
+        note_kind = target.kind
+        note_id = target.note_id
+        source_id = target.source_id
         text = _text(item)
         nested_paragraphs = item.get("paragraphs", [])
         if isinstance(nested_paragraphs, Sequence) and not isinstance(nested_paragraphs, (str, bytes)):
@@ -567,7 +589,7 @@ def _classify_note_items(inspection: Mapping[str, Any]) -> list[dict[str, Any]]:
             role = "author_information"
             explicit_spans = list(_AUTHOR_INFORMATION_TERM_RE.finditer(text))
             confidence = 0.96 if explicit_spans and _has_inspector_span_evidence(item) else 0.78
-            evidence = ["author_information_marker", "footnote_item"]
+            evidence = ["author_information_marker", f"{note_kind}_item"]
             evidence.extend(
                 f"author_information_span={match.start()}:{match.end()}"
                 for match in explicit_spans
@@ -575,17 +597,19 @@ def _classify_note_items(inspection: Mapping[str, Any]) -> list[dict[str, Any]]:
         else:
             role = "ordinary_footnote"
             confidence = 0.90
-            evidence = ["footnote_item"]
+            evidence = [f"{note_kind}_item"]
         record: dict[str, Any] = {
             "source_id": source_id,
-            "kind": "footnote",
+            "kind": note_kind,
             "id": source_id,
-            "footnote_id": note_id,
+            "note_id": note_id,
+            f"{note_kind}_id": note_id,
             "index": item.get("index", index),
             "role": role,
             "confidence": round(max(0.0, min(1.0, confidence)), 2),
             "evidence": evidence,
             "text_preview": _preview(item, text),
+            "target": dict(target.target),
         }
         # Formatting evidence, when a future Inspector supplies it, is kept
         # on the note target so formatter checks can use it directly.

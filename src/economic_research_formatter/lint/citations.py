@@ -11,7 +11,8 @@ from economic_research_formatter.models.citations import CitationCandidate
 from .common import (
     RuleContext,
     finding,
-    footnote_info,
+    note_info,
+    note_linkage_issues,
     rule_severity,
     text_of,
 )
@@ -305,6 +306,7 @@ def _candidate_paragraphs(ctx: RuleContext) -> list[dict[str, Any]]:
         "table_note",
         "author_information",
         "ordinary_footnote",
+        "endnote",
     }
     result: list[dict[str, Any]] = []
     for paragraph in ctx.paragraph_list:
@@ -583,43 +585,67 @@ def _narrative(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, Any]
 
 
 def _footnote_items(ctx: RuleContext) -> list[dict[str, Any]]:
-    """Return actual footnote items while retaining nested paragraph evidence."""
+    """Return actual footnote/endnote items with their original kind.
 
-    notes = footnote_info(ctx.inspection)
-    values = notes.get("items", [])
-    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)) or not values:
-        values = notes.get("paragraphs", [])
-    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
-        values = []
-    context_notes = [item for item in ctx.paragraph_list if item.get("kind") == "footnote"]
+    The historical helper name is retained because ``references.py`` imports
+    it, but its contract is now the shared note abstraction used by both
+    citation and reference rules.
+    """
+
     result: list[dict[str, Any]] = []
-    for index, raw in enumerate(values):
-        if not isinstance(raw, Mapping):
+    for note in ctx.paragraph_list:
+        kind = str(note.get("kind", "")).casefold()
+        if kind not in {"footnote", "endnote"}:
             continue
-        item = dict(raw)
-        note_id = item.get("id", index)
-        context_note = next(
-            (note for note in context_notes if str(note.get("footnote_id", note.get("id"))) == str(note_id)),
-            None,
-        )
-        if context_note is not None:
-            target_note = context_note
-        else:
-            target_note = {
-                **item,
-                "id": str(item.get("source_id") or f"footnote-{note_id}"),
-                "source_id": str(item.get("source_id") or f"footnote-{note_id}"),
-                "footnote_id": note_id,
-                "kind": "footnote",
+        item = dict(note)
+        target = item.get("target")
+        if not isinstance(target, Mapping):
+            note_id = item.get(f"{kind}_id", item.get("note_id"))
+            target = {
+                "kind": kind,
+                "id": str(item.get("source_id") or item.get("id") or f"{kind}-{note_id}"),
+                "source_id": str(item.get("source_id") or item.get("id") or f"{kind}-{note_id}"),
+                "note_id": note_id,
+                f"{kind}_id": note_id,
+                "index": item.get("index"),
+                "text_preview": text_of(item)[:80],
             }
         nested = item.get("paragraphs", [])
-        paragraphs = [dict(paragraph) for paragraph in nested if isinstance(paragraph, Mapping)] if isinstance(nested, Sequence) and not isinstance(nested, (str, bytes)) else []
+        paragraphs = (
+            [dict(paragraph) for paragraph in nested if isinstance(paragraph, Mapping)]
+            if isinstance(nested, Sequence) and not isinstance(nested, (str, bytes))
+            else []
+        )
         if not paragraphs:
-            paragraphs = [{"id": f"{target_note['id']}-p-0000", "text": text_of(item), "text_preview": text_of(item)[:80]}]
+            paragraphs = [{"id": f"{target.get('id', kind)}-p-0000", "text": text_of(item), "text_preview": text_of(item)[:80]}]
         text = "\n".join(text_of(paragraph) for paragraph in paragraphs).strip()
         if not text:
             text = text_of(item).strip()
-        result.append({"item": item, "target": target_note, "paragraphs": paragraphs, "text": text})
+        result.append(
+            {
+                "item": item,
+                "target": dict(target),
+                "kind": kind,
+                "note_id": item.get(f"{kind}_id", item.get("note_id")),
+                "text_length": item.get("text_length"),
+                "text_truncated": bool(
+                    item.get("text_truncated")
+                    or any(
+                        isinstance(paragraph, Mapping) and paragraph.get("text_truncated")
+                        for paragraph in paragraphs
+                    )
+                ),
+                "preview_only": bool(
+                    item.get("preview_only")
+                    or any(
+                        isinstance(paragraph, Mapping) and paragraph.get("preview_only")
+                        for paragraph in paragraphs
+                    )
+                ),
+                "paragraphs": paragraphs,
+                "text": text,
+            }
+        )
     return result
 
 
@@ -651,6 +677,8 @@ def _footnote_candidates(note: Mapping[str, Any]) -> list[CitationCandidate]:
 def _footnote_semantics(note: Mapping[str, Any]) -> tuple[str, list[CitationCandidate]]:
     text = str(note.get("text", "")).strip()
     candidates = _footnote_candidates(note)
+    if _preview_only_truncated(note):
+        return "insufficient_evidence", candidates
     if _PURE_LITERATURE_FOOTNOTE_RE.fullmatch(text):
         return "pure_literature_index", candidates
     normalized_text = text.strip(" .,。；;")
@@ -664,6 +692,32 @@ def _footnote_semantics(note: Mapping[str, Any]) -> tuple[str, list[CitationCand
     return "ordinary_content_note", candidates
 
 
+def _preview_only_truncated(note: Mapping[str, Any]) -> bool:
+    """Return whether the note text evidence hides content after the preview."""
+
+    values: list[Mapping[str, Any]] = [note]
+    for key in ("item", "target"):
+        value = note.get(key)
+        if isinstance(value, Mapping):
+            values.append(value)
+    paragraphs = note.get("paragraphs", [])
+    if isinstance(paragraphs, Sequence) and not isinstance(paragraphs, (str, bytes)):
+        values.extend(value for value in paragraphs if isinstance(value, Mapping))
+    for value in values:
+        if not value.get("preview_only"):
+            continue
+        if value.get("text_truncated") is True:
+            return True
+        text_length = value.get("text_length")
+        preview = value.get("text_preview")
+        try:
+            if text_length is not None and isinstance(preview, str) and int(text_length) > len(preview):
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 def _footnote_finding(
     rule: Mapping[str, Any],
     note: Mapping[str, Any],
@@ -673,26 +727,68 @@ def _footnote_finding(
     observed: Mapping[str, Any],
     confidence: float,
 ) -> dict[str, Any]:
+    target = note.get("target")
+    target = target if isinstance(target, Mapping) else {}
+    item = note.get("item")
+    item = item if isinstance(item, Mapping) else {}
+    kind = str(note.get("kind") or target.get("kind") or item.get("kind") or "footnote").casefold()
+    if kind not in {"footnote", "endnote"}:
+        kind = "footnote"
+    note_observed = dict(observed)
+    if kind == "footnote":
+        note_observed.setdefault("footnote_semantics", observed.get("footnote_semantics"))
+        note_observed.setdefault("footnote_paragraph_ids", [paragraph.get("id") for paragraph in note["paragraphs"]])
+    else:
+        note_observed.pop("footnote_semantics", None)
+        note_observed.pop("footnote_paragraph_ids", None)
+        note_observed.setdefault("endnote_semantics", observed.get("endnote_semantics", observed.get("footnote_semantics")))
+        note_observed.setdefault("endnote_paragraph_ids", [paragraph.get("id") for paragraph in note["paragraphs"]])
     return finding(
         rule,
         status,
         message,
         paragraph=note["target"],
-        observed={**observed, "footnote_paragraph_ids": [paragraph.get("id") for paragraph in note["paragraphs"]]},
+        target=note["target"],
+        observed=note_observed,
         confidence=confidence,
     )
 
 
 def _footnote_literature(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, Any]]:
-    info = footnote_info(ctx.inspection)
-    count = info.get("actual_count", info.get("count", 0))
-    try:
-        count = int(count or 0)
-    except (TypeError, ValueError):
-        count = 0
+    count = 0
+    for kind in ("footnote", "endnote"):
+        info = note_info(ctx.inspection, kind)
+        value = info.get("actual_count", info.get("count", 0))
+        try:
+            count += int(value or 0)
+        except (TypeError, ValueError):
+            continue
+    linkage_issues = note_linkage_issues(ctx.inspection)
+    if count == 0 and linkage_issues:
+        return [
+            finding(
+                rule,
+                "MANUAL_REVIEW",
+                "正文注释引用与脚注或尾注定义无法一一对应。",
+                target=ctx.document_target,
+                observed={"note_linkage_issues": linkage_issues},
+                confidence=0.40,
+            )
+        ]
     if count == 0:
-        return _not_applicable(rule, ctx, "文档没有实际脚注。")
+        return _not_applicable(rule, ctx, "文档没有实际脚注或尾注。")
     results: list[dict[str, Any]] = []
+    if linkage_issues:
+        results.append(
+            finding(
+                rule,
+                "MANUAL_REVIEW",
+                "脚注或尾注定义与正文引用无法一一对应；仅对已绑定注释继续检查。",
+                target=ctx.document_target,
+                observed={"note_linkage_issues": linkage_issues},
+                confidence=0.40,
+            )
+        )
     for note in _footnote_items(ctx):
         semantics, candidates = _footnote_semantics(note)
         if semantics == "pure_literature_index":
@@ -701,7 +797,7 @@ def _footnote_literature(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict
                     rule,
                     note,
                     rule_severity(rule),
-                    "文献引文应采用文内括号形式，不应仅置于脚注。",
+                    "文献引文应采用文内括号形式，不应仅置于脚注或尾注。",
                     observed={"footnote_semantics": semantics, "candidates": [candidate.to_dict() for candidate in candidates]},
                     confidence=0.98,
                 )
@@ -712,16 +808,32 @@ def _footnote_literature(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict
                     rule,
                     note,
                     "MANUAL_REVIEW",
-                    "脚注包含疑似文献作者-年份信号，但语义不足以自动确认。",
+                    "脚注或尾注包含疑似文献作者-年份信号，但语义不足以自动确认。",
                     observed={"footnote_semantics": semantics, "text_preview": note["text"][:80]},
                     confidence=0.55,
+                )
+            )
+        elif semantics == "insufficient_evidence":
+            results.append(
+                _footnote_finding(
+                    rule,
+                    note,
+                    "MANUAL_REVIEW",
+                    "脚注或尾注仅提供截断预览，无法排除预览范围外的文献引文。",
+                    observed={
+                        "footnote_semantics": semantics,
+                        "text_preview": note["text"][:80],
+                        "preview_only": True,
+                        "text_truncated": True,
+                    },
+                    confidence=0.40,
                 )
             )
     if results:
         return results
     if not _footnote_items(ctx):
-        return [finding(rule, "MANUAL_REVIEW", "文档存在实际脚注，但 Inspector 未提供可判断语义的脚注段落证据。", target=ctx.document_target, observed={"actual_footnote_count": count}, confidence=0.40)]
-    return _not_applicable(rule, ctx, "未识别到仅以脚注承载的文献引文。")
+        return [finding(rule, "MANUAL_REVIEW", "文档存在实际脚注或尾注，但 Inspector 未提供可判断语义的注释段落证据。", target=ctx.document_target, observed={"actual_note_count": count}, confidence=0.40)]
+    return _not_applicable(rule, ctx, "未识别到仅以脚注或尾注承载的文献引文。")
 
 
 def _unsupported(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, Any]]:

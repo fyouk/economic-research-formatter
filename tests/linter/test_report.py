@@ -62,6 +62,8 @@ def test_markdown_aggregates_repeated_findings_but_keeps_rule_and_examples() -> 
 
     assert markdown.startswith("# 《经济研究》格式审计报告")
     assert markdown.count("ER-MS-REF-LAYOUT-001") >= 1
-    assert "53" in markdown
+    assert "共记录 2 条规则结果，涉及 2 个受影响目标。" in markdown
+    assert "| ER-MS-REF-LAYOUT-001 | ERROR | 2 | 2 |" in markdown
+    assert "53" not in markdown
     assert "p-1" in markdown or "p-2" in markdown
     assert markdown.count("参考文献条目格式不符合要求") <= 2

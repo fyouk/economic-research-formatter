@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 from lxml import etree
 
@@ -11,8 +11,14 @@ from .package import DocxPackage, W_NS, local_name, qname
 from .styles import StyleResolver
 
 
-SEPARATOR_TYPES = {"separator", "continuationSeparator"}
+NORMAL_NOTE_TYPES = {None, "normal"}
 _MAX_PREVIEW = 80
+_NOTE_PROPERTY_NAMES = ("numFmt", "numStart", "numRestart")
+_DEFAULT_NOTE_PROPERTIES = {
+    "numFmt": "decimal",
+    "numStart": "1",
+    "numRestart": "continuous",
+}
 
 
 def _preview(value: str) -> str:
@@ -60,6 +66,9 @@ def _inspect_note_paragraph(
             "start": offset,
             "end": offset + len(run_text),
             "text_preview": _preview(run_text),
+            "text_length": len(run_text),
+            "text_truncated": len(run_text) > _MAX_PREVIEW,
+            "preview_only": not include_text,
             "formatting": formatting,
             "is_whitespace_only": bool(run_text) and not run_text.strip(),
             "has_field_char": run.find(qname(W_NS, "fldChar")) is not None,
@@ -104,6 +113,9 @@ def _inspect_note_paragraph(
         "formatting": formatting,
         "effective_formatting": formatting["effective"],
         "text_preview": _preview(text),
+        "text_length": len(text),
+        "text_truncated": len(text) > _MAX_PREVIEW,
+        "preview_only": not include_text,
         "runs": runs,
     }
     if include_text:
@@ -124,12 +136,183 @@ def _note_part(package: DocxPackage, part_type: str) -> tuple[str, Any] | None:
     return (conventional, root) if root is not None else None
 
 
+def _document_note_references(package: DocxPackage, part_type: str) -> list[int]:
+    refs: list[int] = []
+    tag = "footnoteReference" if part_type == "footnotes" else "endnoteReference"
+    for reference in package.document_root.iter(qname(W_NS, tag)):
+        if any(
+            ancestor.tag in {qname(W_NS, "del"), qname(W_NS, "moveFrom")}
+            for ancestor in reference.iterancestors()
+        ):
+            continue
+        try:
+            refs.append(int(reference.get(qname(W_NS, "id"))))
+        except (TypeError, ValueError):
+            continue
+    return refs
+
+
+def _section_elements(root: etree._Element) -> list[etree._Element]:
+    """Return document sections in body order, including the final section."""
+
+    body = root.find(qname(W_NS, "body"))
+    if body is None:
+        return []
+    sections: list[etree._Element] = []
+    for paragraph in body.iter(qname(W_NS, "p")):
+        if any(ancestor.tag == qname(W_NS, "tbl") for ancestor in paragraph.iterancestors()):
+            continue
+        section = paragraph.find(f"{qname(W_NS, 'pPr')}/{qname(W_NS, 'sectPr')}")
+        if section is not None:
+            sections.append(section)
+    final = body.find(qname(W_NS, "sectPr"))
+    if final is not None:
+        sections.append(final)
+    return sections
+
+
+def _settings_root(package: DocxPackage) -> etree._Element | None:
+    """Locate settings through its relationship, with a safe conventional fallback."""
+
+    for relation in package.relationships("word/document.xml").values():
+        if relation.rel_type.endswith("/settings"):
+            target = package.resolve_target("word/document.xml", relation.target)
+            root = package.xml(target)
+            if root is not None:
+                return root
+    return package.xml("word/settings.xml")
+
+
+def _raw_note_properties(parent: etree._Element | None, kind: str) -> dict[str, str]:
+    if parent is None:
+        return {}
+    note_pr = parent.find(qname(W_NS, f"{kind}Pr"))
+    if note_pr is None:
+        return {}
+    result: dict[str, str] = {}
+    for property_name in _NOTE_PROPERTY_NAMES:
+        child = note_pr.find(qname(W_NS, property_name))
+        value = child.get(qname(W_NS, "val")) if child is not None else None
+        if value is not None:
+            result[property_name] = value
+    return result
+
+
+def _section_note_properties(
+    document_wide: Mapping[str, Any],
+    section_override: Mapping[str, Any],
+    section_index: int,
+) -> dict[str, Any]:
+    effective = dict(_DEFAULT_NOTE_PROPERTIES)
+    effective.update(document_wide)
+    effective.update(section_override)
+    sources = {
+        property_name: (
+            "section"
+            if property_name in section_override
+            else "settings"
+            if property_name in document_wide
+            else "default"
+        )
+        for property_name in _NOTE_PROPERTY_NAMES
+    }
+    return {
+        "section_index": section_index,
+        "section_override": dict(section_override),
+        "effective_properties": effective,
+        "property_sources": sources,
+        "property_evidence": {
+            property_name: {
+                "value": effective.get(property_name),
+                "source": sources[property_name],
+            }
+            for property_name in _NOTE_PROPERTY_NAMES
+        },
+    }
+
+
+def _effective_note_properties(package: DocxPackage, part_type: str) -> dict[str, Any]:
+    """Compute defaults -> settings -> section effective note properties."""
+
+    kind = part_type.removesuffix("s")
+    document_wide = _raw_note_properties(_settings_root(package), kind)
+    sections: list[dict[str, Any]] = []
+    for section_index, section in enumerate(_section_elements(package.document_root)):
+        section_override = _raw_note_properties(section, kind)
+        sections.append(_section_note_properties(document_wide, section_override, section_index))
+    if not sections:
+        sections.append(_section_note_properties(document_wide, {}, 0))
+    effective_values = [section["effective_properties"] for section in sections]
+    restarts = [value["numRestart"] for value in effective_values if value.get("numRestart") is not None]
+    return {
+        "document_wide_properties": document_wide,
+        "section_properties": sections,
+        "effective_properties": effective_values,
+        "num_restart": restarts[0] if restarts else None,
+        "num_restarts": restarts,
+    }
+
+
+def note_properties_for_section(
+    report: Mapping[str, Any],
+    section_index: int,
+) -> dict[str, Any]:
+    """Return the effective note-property evidence for one owning section."""
+
+    document_wide_raw = report.get("document_wide_properties", {})
+    document_wide = dict(document_wide_raw) if isinstance(document_wide_raw, Mapping) else {}
+    section_records = report.get("section_properties", [])
+    selected: dict[str, Any] | None = None
+    if isinstance(section_records, Sequence) and not isinstance(section_records, (str, bytes)):
+        for raw_record in section_records:
+            if not isinstance(raw_record, Mapping):
+                continue
+            if raw_record.get("section_index") == section_index:
+                selected = dict(raw_record)
+                break
+    if selected is None:
+        selected = _section_note_properties(document_wide, {}, section_index)
+    effective_raw = selected.get("effective_properties", {})
+    effective = dict(effective_raw) if isinstance(effective_raw, Mapping) else {}
+    section_override_raw = selected.get("section_override", {})
+    section_override = dict(section_override_raw) if isinstance(section_override_raw, Mapping) else {}
+    property_sources_raw = selected.get("property_sources", {})
+    property_sources = (
+        dict(property_sources_raw)
+        if isinstance(property_sources_raw, Mapping)
+        else _section_note_properties(document_wide, section_override, section_index)["property_sources"]
+    )
+    property_evidence_raw = selected.get("property_evidence", {})
+    property_evidence = (
+        deepcopy(property_evidence_raw)
+        if isinstance(property_evidence_raw, Mapping)
+        else {
+            property_name: {
+                "value": effective.get(property_name),
+                "source": property_sources.get(property_name),
+            }
+            for property_name in _NOTE_PROPERTY_NAMES
+        }
+    )
+    return {
+        **effective,
+        "section_index": section_index,
+        "document_wide_properties": document_wide,
+        "section_override": section_override,
+        "effective_properties": effective,
+        "property_sources": property_sources,
+        "property_evidence": property_evidence,
+    }
+
+
 def _inspect_note_part(
     package: DocxPackage,
     part_type: str,
     include_text: bool = False,
     resolver: StyleResolver | None = None,
 ) -> dict[str, Any]:
+    property_report = _effective_note_properties(package, part_type)
+    refs = _document_note_references(package, part_type)
     found = _note_part(package, part_type)
     if found is None:
         return {
@@ -139,9 +322,9 @@ def _inspect_note_part(
             "ids": [],
             "items": [],
             "paragraphs": [],
-            "references": [],
-            "one_to_one": True,
-            "num_restart": None,
+            "references": refs,
+            "one_to_one": not refs,
+            **property_report,
         }
     part_name, root = found
     if resolver is None:
@@ -156,7 +339,7 @@ def _inspect_note_part(
             note_id = int(value) if value is not None else None
         except (TypeError, ValueError):
             note_id = None
-        if note.get(qname(W_NS, "type")) in SEPARATOR_TYPES or note_id in (-1, 0):
+        if note.get(qname(W_NS, "type")) not in NORMAL_NOTE_TYPES or note_id in (-1, 0):
             if note_id is not None:
                 separators.append(note_id)
             continue
@@ -172,13 +355,20 @@ def _inspect_note_part(
                 resolver=resolver,
                 include_text=include_text,
             )
-            for paragraph_index, paragraph in enumerate(note.findall(qname(W_NS, "p")))
+            for paragraph_index, paragraph in enumerate(note.iter(qname(W_NS, "p")))
         ]
-        text = "".join(paragraph.get("text", paragraph["text_preview"]) for paragraph in paragraphs)
+        full_text = "".join(_visible_text(paragraph) for paragraph in note.iter(qname(W_NS, "p")))
+        text = full_text if include_text else _preview(full_text)
         first = paragraphs[0] if paragraphs else None
         item: dict[str, Any] = {
             "id": note_id,
+            "kind": part_type.removesuffix("s"),
+            "note_id": note_id,
+            f"{part_type.removesuffix('s')}_id": note_id,
             "text_preview": _preview(text),
+            "text_length": len(full_text),
+            "text_truncated": len(full_text) > _MAX_PREVIEW,
+            "preview_only": not include_text,
             "paragraphs": paragraphs,
             "runs": [run for paragraph in paragraphs for run in paragraph["runs"]],
             "formatting": deepcopy(first["formatting"]) if first else {"raw": {}, "effective": {}, "source": {}, "mixed_runs": False},
@@ -188,22 +378,6 @@ def _inspect_note_part(
         if include_text:
             item["text"] = text
         items.append(item)
-    refs = []
-    tag = "footnoteReference" if part_type == "footnotes" else "endnoteReference"
-    for reference in package.document_root.iter(qname(W_NS, tag)):
-        try:
-            refs.append(int(reference.get(qname(W_NS, "id"))))
-        except (TypeError, ValueError):
-            continue
-    restarts: list[str] = []
-    note_tag = "footnotePr" if part_type == "footnotes" else "endnotePr"
-    for sect_pr in package.document_root.iter(qname(W_NS, "sectPr")):
-        note_pr = sect_pr.find(qname(W_NS, note_tag))
-        if note_pr is None:
-            continue
-        restart_el = note_pr.find(qname(W_NS, "numRestart"))
-        if restart_el is not None and restart_el.get(qname(W_NS, "val")):
-            restarts.append(restart_el.get(qname(W_NS, "val")))
     return {
         "part": part_name,
         "actual_count": len(actual),
@@ -217,8 +391,7 @@ def _inspect_note_part(
         "separator_ids": separators,
         "references": refs,
         "one_to_one": sorted(actual) == sorted(refs),
-        "num_restart": restarts[0] if restarts else None,
-        "num_restarts": restarts,
+        **property_report,
     }
 
 
@@ -233,4 +406,4 @@ def inspect_notes(
     }
 
 
-__all__ = ["inspect_notes"]
+__all__ = ["inspect_notes", "note_properties_for_section"]

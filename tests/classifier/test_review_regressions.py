@@ -96,7 +96,7 @@ def test_low_confidence_author_information_is_manual_and_carries_classifier_evid
     assert finding["observed"]["classification"]["evidence"]
 
 
-def test_title_marker_can_be_established_by_inspector_footnote_reference_evidence() -> None:
+def test_title_marker_without_custom_mark_evidence_requires_review() -> None:
     inspection = _inspection(
         {"text": "题目：研究标题", "footnote_references": [{"id": 1, "marker": "*"}]},
         {"text": "张三", "role_hint": "author_name"},
@@ -104,8 +104,9 @@ def test_title_marker_can_be_established_by_inspector_footnote_reference_evidenc
 
     finding = _finding(lint_inspection(inspection), "ER-MS-TITLE-002")
 
-    assert finding["status"] == "PASS"
+    assert finding["status"] == "MANUAL_REVIEW"
     assert finding["observed"]["footnote_reference_evidence"]
+    assert finding["observed"]["marker_evidence"][0]["reason"] == "marker_without_custom_mark_evidence"
 
 
 def test_author_information_note_is_classified_separately_and_missing_formatting_is_manual() -> None:

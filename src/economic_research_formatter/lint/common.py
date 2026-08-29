@@ -7,6 +7,13 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from economic_research_formatter.models.audit import make_finding, target_for_document, target_for_paragraph
+from economic_research_formatter.models.formatting import CN_SIZE_TO_PT
+from economic_research_formatter.models.notes import (
+    iter_note_targets,
+    note_info as _note_info,
+    note_linkage as _note_linkage,
+)
+from economic_research_formatter.models.numbering import numbering_state as _canonical_numbering_state
 
 from .registry import (
     classification_by_id,
@@ -20,45 +27,27 @@ from .registry import (
 )
 
 
-CN_SIZE_TO_PT = {
-    "初号": 42.0,
-    "小初号": 36.0,
-    "一号": 26.0,
-    "小一号": 24.0,
-    "二号": 22.0,
-    "小二号": 18.0,
-    "三号": 16.0,
-    "小三号": 15.0,
-    "四号": 14.0,
-    "小四号": 12.0,
-    "五号": 10.5,
-    "小五号": 9.0,
-    "六号": 7.5,
-    "小六号": 6.5,
-    "七号": 5.5,
-    "八号": 5.0,
-}
-
-
 # Heuristic author/author-information roles are intentionally below this
 # threshold.  Findings attached to such roles remain useful evidence, but a
 # rule must not turn an uncertain role into a deterministic pass/error.
 CLASSIFICATION_MANUAL_REVIEW_THRESHOLD = 0.85
 
 
+def _raw_note_items(inspection: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return normalized footnote/endnote items with stable note targets."""
+
+    return [target.to_mapping() for target in iter_note_targets(inspection)]
+
+
 def _raw_footnote_items(inspection: Mapping[str, Any]) -> list[dict[str, Any]]:
-    notes = inspection.get("notes", {}) if isinstance(inspection, Mapping) else {}
-    if not isinstance(notes, Mapping):
-        return []
-    footnotes = notes.get("footnotes", notes)
-    if not isinstance(footnotes, Mapping):
-        return []
-    values = footnotes.get("items")
-    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)) or not values:
-        values = footnotes.get("paragraphs", [])
-    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
-        return []
-    return [dict(value) for value in values if isinstance(value, Mapping)]
+    """Compatibility alias for callers that historically used this helper.
+
+    The citation/reference linter now intentionally receives both note kinds;
+    keeping the old name avoids breaking private helper imports in existing
+    downstream tests.
+    """
+
+    return _raw_note_items(inspection)
 
 
 @dataclass
@@ -87,7 +76,7 @@ class RuleContext:
         # Note-part items are not body paragraphs and are therefore kept out of
         # ``classification.items`` by the classifier.  They are nevertheless
         # first-class lint targets when the Inspector exposes them.
-        raw_notes = _raw_footnote_items(self.inspection)
+        raw_notes = _raw_note_items(self.inspection)
         classified_notes = note_values if isinstance(note_values, Sequence) and not isinstance(note_values, (str, bytes)) else []
         notes_by_source = {
             str(item.get("source_id") or item.get("id")): item
@@ -96,12 +85,30 @@ class RuleContext:
         }
         for index, raw_note in enumerate(raw_notes):
             note = dict(raw_note)
-            note_id = note.get("id", index)
-            source_id = str(note.get("source_id") or f"footnote-{note_id}")
+            kind = str(note.get("kind") or "footnote").casefold()
+            if kind not in {"footnote", "endnote"}:
+                kind = "footnote"
+            note_id = note.get(f"{kind}_id", note.get("note_id", index))
+            source_id = str(note.get("source_id") or f"{kind}-{note_id}")
             note.setdefault("source_id", source_id)
             note["id"] = source_id
-            note["kind"] = "footnote"
-            note.setdefault("footnote_id", note_id)
+            note["kind"] = kind
+            note.setdefault("note_id", note_id)
+            note.setdefault(f"{kind}_id", note_id)
+            target = note.get("target")
+            if not isinstance(target, Mapping):
+                target = {
+                    "kind": kind,
+                    "id": source_id,
+                    "source_id": source_id,
+                    "note_id": note_id,
+                    f"{kind}_id": note_id,
+                    "index": note.get("index", index),
+                }
+                if note.get("text_preview") is not None:
+                    target["text_preview"] = note["text_preview"]
+                note["target"] = target
+            note.setdefault("role", "ordinary_footnote")
             classification_item = notes_by_source.get(source_id)
             if classification_item is not None:
                 note.update(
@@ -446,6 +453,15 @@ def _relation_matches(actual: Any, expected: Any) -> bool:
     return normalize(actual) == normalize(expected)
 
 
+def _numbering_state(paragraph: Mapping[str, Any]) -> bool | None:
+    """Return explicit numbering state without relying on mapping truthiness."""
+
+    raw = paragraph.get("numbering")
+    if raw is None:
+        raw = paragraph.get("numPr")
+    return _canonical_numbering_state(raw)
+
+
 _DIRECT_FORMAT_REQUIREMENTS = {
     "east_asia_font",
     "ascii_font",
@@ -593,10 +609,12 @@ def check_paragraph_format(
             observed["leading_spaces_cn"] = actual
             mismatches["leading_spaces_cn"] = {"observed": actual, "expected": expected}
     if "numbered" in requirement:
-        numbered = bool(paragraph.get("numbering") or paragraph.get("numPr"))
+        numbered = _numbering_state(paragraph)
         expected = bool(requirement.get("numbered"))
         observed["numbered"] = numbered
-        if numbered != expected:
+        if numbered is None:
+            observed.setdefault("unchecked_fields", []).append("numbered")
+        elif numbered != expected:
             mismatches["numbered"] = {"observed": numbered, "expected": expected}
     unchecked = observed.get("unchecked_fields", [])
     if not mismatches and not unchecked:
@@ -631,11 +649,37 @@ def text_has_latin_or_digit(value: str) -> bool:
 
 
 def footnote_info(inspection: Mapping[str, Any]) -> Mapping[str, Any]:
-    notes = inspection.get("notes", {})
-    if not isinstance(notes, Mapping):
+    return _note_info(inspection, "footnote")
+
+
+def note_info(inspection: Mapping[str, Any], kind: str) -> Mapping[str, Any]:
+    """Return one normalized note collection for lint rules."""
+
+    normalized = str(kind).casefold()
+    if normalized not in {"footnote", "endnote"}:
         return {}
-    value = notes.get("footnotes", notes)
-    return value if isinstance(value, Mapping) else {}
+    return _note_info(inspection, normalized)  # type: ignore[arg-type]
+
+
+def note_linkage_issues(
+    inspection: Mapping[str, Any],
+    kinds: Sequence[str] = ("footnote", "endnote"),
+) -> list[dict[str, Any]]:
+    """Return note/reference linkage mismatches without exposing note content."""
+
+    issues: list[dict[str, Any]] = []
+    for raw_kind in kinds:
+        kind = str(raw_kind).casefold()
+        if kind not in {"footnote", "endnote"}:
+            continue
+        info = note_info(inspection, kind)
+        if not info:
+            continue
+        linkage = _note_linkage(info, kind)  # type: ignore[arg-type]
+        if not linkage.get("has_issue"):
+            continue
+        issues.append({"part_present": info.get("part") is not None, **linkage})
+    return issues
 
 
 def equation_info(inspection: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -676,6 +720,8 @@ __all__ = [
     "is_chinese_text",
     "meaningful_runs",
     "mismatch_message",
+    "note_info",
+    "note_linkage_issues",
     "observed_formatting",
     "paragraph_target",
     "paragraph_value",

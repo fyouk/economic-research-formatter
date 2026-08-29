@@ -257,6 +257,38 @@ def test_footnote_paragraphs_are_checked_once_for_latin_font() -> None:
     assert footnote_findings[0]["status"] == "ERROR"
 
 
+def test_legacy_note_item_without_nested_paragraphs_still_checks_latin_font() -> None:
+    inspection = _inspection(
+        {"text": "正文"},
+        notes={
+            "footnotes": {
+                "actual_count": 1,
+                "items": [
+                    {
+                        "id": 1,
+                        "text": "alpha 123",
+                        "runs": [
+                            {
+                                "text": "alpha 123",
+                                "effective_formatting": {
+                                    "ascii_font": "Times New Roman",
+                                    "hansi_font": "Times New Roman",
+                                },
+                            }
+                        ],
+                    }
+                ],
+            }
+        },
+    )
+
+    findings = _findings(lint_inspection(inspection), "ER-MS-LATIN-FONT-001")
+    footnotes = [item for item in findings if item["target"].get("scope") == "footnote"]
+
+    assert len(footnotes) == 1
+    assert footnotes[0]["status"] == "PASS"
+
+
 def test_title_numbered_footnote_marker_is_error() -> None:
     inspection = _inspection(
         {

@@ -50,14 +50,61 @@ def _examples(aggregate: Mapping[str, Any]) -> str:
 def render_markdown(audit: Mapping[str, Any]) -> str:
     if not isinstance(audit, Mapping):
         raise TypeError("audit must be a mapping")
-    summary = audit.get("summary", {})
-    summary = dict(summary) if isinstance(summary, Mapping) else {}
+    raw_summary = audit.get("summary", {})
+    raw_summary = dict(raw_summary) if isinstance(raw_summary, Mapping) else {}
     findings = audit.get("findings", [])
     findings = [dict(item) for item in findings if isinstance(item, Mapping)] if isinstance(findings, Sequence) and not isinstance(findings, (str, bytes)) else []
-    if not summary.get("aggregates"):
-        summary = {**summary, **build_summary(findings)}
+    if findings:
+        # Detailed findings are authoritative.  Mixing stale caller-provided
+        # aggregates with freshly derived totals creates internally impossible
+        # reports, so recompute the complete summary as one coherent unit.
+        summary = build_summary(findings)
+    else:
+        # Summary-only legacy callers have no detailed source from which to
+        # recompute.  Preserve their aggregates while deriving the newer dual
+        # count fields from one consistent legacy finding count.
+        summary = dict(raw_summary)
+        counts = summary.get("by_status")
+        counts = dict(counts) if isinstance(counts, Mapping) else {}
+        aggregates = summary.get("aggregates")
+        if not isinstance(aggregates, Sequence) or isinstance(aggregates, (str, bytes)):
+            aggregates = []
+        else:
+            aggregates = list(aggregates)
+        finding_count = summary.get("finding_count", summary.get("total_findings"))
+        if finding_count is None:
+            finding_count = sum(int(value or 0) for value in counts.values())
+        try:
+            finding_count = max(0, int(finding_count))
+        except (TypeError, ValueError):
+            finding_count = 0
+        affected_target_count = summary.get(
+            "affected_target_count", summary.get("total_affected_targets", finding_count)
+        )
+        try:
+            affected_target_count = max(0, int(affected_target_count))
+        except (TypeError, ValueError):
+            affected_target_count = finding_count
+        summary.update(
+            {
+                "total_findings": finding_count,
+                "finding_count": finding_count,
+                "affected_target_count": affected_target_count,
+                "total_affected_targets": affected_target_count,
+                "by_status": counts,
+                "by_status_affected": summary.get("by_status_affected", dict(counts)),
+                "by_rule_and_status": summary.get("by_rule_and_status", {}),
+                "by_rule_and_status_affected": summary.get(
+                    "by_rule_and_status_affected", {}
+                ),
+                "aggregates": aggregates,
+                "table_aggregates": summary.get("table_aggregates", []),
+            }
+        )
     counts = summary.get("by_status", {})
     counts = counts if isinstance(counts, Mapping) else {}
+    affected_counts = summary.get("by_status_affected", {})
+    affected_counts = affected_counts if isinstance(affected_counts, Mapping) else {}
     input_info = audit.get("input", {})
     input_info = input_info if isinstance(input_info, Mapping) else {}
     capabilities = audit.get("capabilities", {})
@@ -71,19 +118,24 @@ def render_markdown(audit: Mapping[str, Any]) -> str:
         [
             "## 总结",
             "",
-            f"共记录 {int(summary.get('total_findings', len(findings)) or 0)} 条规则结果。",
+            f"共记录 {int(summary.get('finding_count', summary.get('total_findings', len(findings))) or 0)} 条规则结果，涉及 {int(summary.get('affected_target_count', len(findings)) or 0)} 个受影响目标。",
             "",
-            "| 状态 | 数量 |",
-            "| --- | ---: |",
+            "| 状态 | finding 数 | 受影响目标 |",
+            "| --- | ---: | ---: |",
         ]
     )
     for status in STATUSES:
         count = counts.get(status, 0)
-        if count:
-            lines.append(f"| {_cell(STATUS_LABELS.get(status, status))}（{status}） | {_cell(count)} |")
+        affected_count = affected_counts.get(status, count)
+        if count or affected_count:
+            lines.append(
+                f"| {_cell(STATUS_LABELS.get(status, status))}（{status}） | "
+                f"{_cell(count)} | {_cell(affected_count)} |"
+            )
 
-    lines.extend(["", "## 按规则聚合", "", "| 规则 | 状态 | 数量 | 说明 | 示例目标 |", "| --- | --- | ---: | --- | --- |"])
+    lines.extend(["", "## 按规则聚合", "", "| 规则 | 状态 | finding 数 | 受影响目标 | 说明 | 示例目标 |", "| --- | --- | ---: | ---: | --- | --- |"])
     aggregates = summary.get("aggregates", [])
+    aggregate_rows = 0
     if isinstance(aggregates, Sequence) and not isinstance(aggregates, (str, bytes)):
         for aggregate in aggregates:
             if not isinstance(aggregate, Mapping):
@@ -118,15 +170,49 @@ def render_markdown(audit: Mapping[str, Any]) -> str:
                     (
                         _cell(aggregate.get("rule_id", "")),
                         _cell(aggregate.get("status", "")),
-                        _cell(aggregate.get("count", 0)),
+                        _cell(aggregate.get("finding_count", aggregate.get("count", 0))),
+                        _cell(aggregate.get("affected_count", aggregate.get("count", 0))),
                         _cell(aggregate.get("message", "")),
                         _cell(_examples(aggregate)),
                     )
                 )
                 + " |"
             )
-    else:
-        lines.append("| - | - | 0 | 没有规则结果 | - |")
+            aggregate_rows += 1
+    if aggregate_rows == 0:
+        lines.append("| - | - | 0 | 0 | 没有规则结果 | - |")
+
+    table_aggregates = summary.get("table_aggregates", [])
+    if isinstance(table_aggregates, Sequence) and not isinstance(table_aggregates, (str, bytes)) and table_aggregates:
+        lines.extend(
+            [
+                "",
+                "## 按表格聚合",
+                "",
+                "同一表格内由相同未知证据触发的结果合并展示；普通 finding 保留逐目标明细，折叠结果在 observed/examples 中保留最多三个示例。",
+                "",
+                "| 规则 | 状态 | 表格 | finding 数 | 受影响目标 | 说明 | 示例目标 |",
+                "| --- | --- | --- | ---: | ---: | --- | --- |",
+            ]
+        )
+        for aggregate in table_aggregates:
+            if not isinstance(aggregate, Mapping):
+                continue
+            lines.append(
+                "| "
+                + " | ".join(
+                    (
+                        _cell(aggregate.get("rule_id", "")),
+                        _cell(aggregate.get("status", "")),
+                        _cell(aggregate.get("table_id", "")),
+                        _cell(aggregate.get("finding_count", aggregate.get("count", 0))),
+                        _cell(aggregate.get("affected_count", aggregate.get("count", 0))),
+                        _cell(aggregate.get("message", "")),
+                        _cell(_examples(aggregate)),
+                    )
+                )
+                + " |"
+            )
 
     lines.extend(["", "## 能力边界", ""])
     labels = (

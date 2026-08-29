@@ -7,7 +7,15 @@ import re
 from typing import Any
 
 from .citations import _footnote_items, _footnote_semantics
-from .common import RuleContext, finding, is_chinese_text, rule_severity, text_of
+from .common import (
+    RuleContext,
+    finding,
+    is_chinese_text,
+    note_info,
+    note_linkage_issues,
+    rule_severity,
+    text_of,
+)
 
 
 REFERENCE_RULE_IDS = {
@@ -298,28 +306,59 @@ def _foreign_manual(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str,
 
 
 def _content_footnote(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, Any]]:
-    notes = ctx.inspection.get("notes", {})
-    notes = notes if isinstance(notes, Mapping) else {}
-    footnotes = notes.get("footnotes", notes)
-    footnotes = footnotes if isinstance(footnotes, Mapping) else {}
-    count = footnotes.get("actual_count", footnotes.get("count", 0))
-    try:
-        count = int(count or 0)
-    except (TypeError, ValueError):
-        count = 0
+    count = 0
+    for kind in ("footnote", "endnote"):
+        info = note_info(ctx.inspection, kind)
+        value = info.get("actual_count", info.get("count", 0))
+        try:
+            count += int(value or 0)
+        except (TypeError, ValueError):
+            continue
+    linkage_issues = note_linkage_issues(ctx.inspection)
+    if count <= 0 and linkage_issues:
+        return [
+            finding(
+                rule,
+                "MANUAL_REVIEW",
+                "正文注释引用与脚注或尾注定义无法一一对应。",
+                target=ctx.document_target,
+                observed={"note_linkage_issues": linkage_issues},
+                confidence=0.40,
+            )
+        ]
     if count <= 0:
-        return _none(rule, ctx, "文档没有实际脚注。")
+        return _none(rule, ctx, "文档没有实际脚注或尾注。")
     notes = _footnote_items(ctx)
     if not notes:
-        return [finding(rule, "MANUAL_REVIEW", "文档存在实际脚注，但 Inspector 未提供可判断语义的脚注段落证据。", target=ctx.document_target, observed={"actual_footnote_count": count}, confidence=0.40)]
+        observed = {"actual_footnote_count": count, "actual_note_count": count}
+        if linkage_issues:
+            observed["note_linkage_issues"] = linkage_issues
+        return [finding(rule, "MANUAL_REVIEW", "文档存在实际脚注或尾注，但 Inspector 未提供可判断语义的注释段落证据。", target=ctx.document_target, observed=observed, confidence=0.40)]
     results: list[dict[str, Any]] = []
+    if linkage_issues:
+        results.append(
+            finding(
+                rule,
+                "MANUAL_REVIEW",
+                "脚注或尾注定义与正文引用无法一一对应；仅对已绑定注释继续检查。",
+                target=ctx.document_target,
+                observed={"note_linkage_issues": linkage_issues},
+                confidence=0.40,
+            )
+        )
     for note in notes:
         semantics, candidates = _footnote_semantics(note)
+        kind = str(note.get("kind", "footnote")).casefold()
+        if kind not in {"footnote", "endnote"}:
+            kind = "footnote"
         observed = {
-            "footnote_semantics": semantics,
+            "note_kind": kind,
+            f"{kind}_semantics": semantics,
             "candidates": [candidate.to_dict() for candidate in candidates],
-            "footnote_paragraph_ids": [paragraph.get("id") for paragraph in note["paragraphs"]],
+            f"{kind}_paragraph_ids": [paragraph.get("id") for paragraph in note["paragraphs"]],
         }
+        if kind == "footnote":
+            observed["footnote_semantics"] = semantics
         if semantics == "content_note_with_inline_citation":
             results.append(
                 finding(
@@ -327,6 +366,7 @@ def _content_footnote(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[st
                     "PASS",
                     "内容注释中的文献已采用文内作者-年份引文形式。",
                     paragraph=note["target"],
+                    target=note["target"],
                     observed=observed,
                     confidence=0.92,
                 )
@@ -338,8 +378,25 @@ def _content_footnote(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[st
                     "MANUAL_REVIEW",
                     "内容注释中的疑似文献引文缺少足够的结构化证据。",
                     paragraph=note["target"],
+                    target=note["target"],
                     observed=observed,
                     confidence=0.55,
+                )
+            )
+        elif semantics == "insufficient_evidence":
+            results.append(
+                finding(
+                    rule,
+                    "MANUAL_REVIEW",
+                    "内容注释仅提供截断预览，无法排除预览范围外的文献引文。",
+                    paragraph=note["target"],
+                    target=note["target"],
+                    observed={
+                        **observed,
+                        "preview_only": True,
+                        "text_truncated": True,
+                    },
+                    confidence=0.40,
                 )
             )
     return results or _none(rule, ctx, "未识别到内容注释中的文献引文。")

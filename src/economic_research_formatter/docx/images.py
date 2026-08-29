@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from io import BytesIO
 from typing import Any
 import warnings
@@ -15,8 +16,9 @@ from .package import DocxPackage, R_NS, W_NS, qname
 DRAWING_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
 A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 # An ordinary paper image is far below this canvas size.  Checking dimensions
-# immediately after reading the image header prevents ``convert`` and
-# ``getdata`` from allocating an unbounded pixel list.
+# immediately after reading the image header prevents ``convert`` from
+# allocating an unbounded pixel buffer.  Pixel statistics below are streamed;
+# they are never copied into a Python list of per-pixel tuples.
 MAX_IMAGE_PIXELS = 25_000_000
 
 
@@ -25,6 +27,13 @@ def _emu(value: str | None) -> int | None:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _external_target_preview(target: str) -> str:
+    normalized = target.lstrip().casefold()
+    if normalized.startswith("file:") or target.startswith(("/", "\\")):
+        return "[local-path]"
+    return "[external-image]"
 
 
 def analyze_image(data: bytes) -> dict[str, Any]:
@@ -47,23 +56,27 @@ def analyze_image(data: bytes) -> dict[str, Any]:
             # channels.  Transparent black line-art should remain grayscale.
             white = Image.new("RGBA", image.size, (255, 255, 255, 255))
             composite = Image.alpha_composite(white, image).convert("RGB")
-            with warnings.catch_warnings():
-                # Pillow 14 will expose get_flattened_data; older supported
-                # versions only provide getdata and emit a forward-looking
-                # deprecation warning.
-                warnings.simplefilter("ignore", category=DeprecationWarning)
-                pixels = list(composite.getdata())
             colored = 0
             nonwhite = 0
             grayscale = True
-            for red, green, blue in pixels:
-                if min(red, green, blue) < thresholds["nonwhite_channel_threshold"]:
-                    nonwhite += 1
-                if max(red, green, blue) - min(red, green, blue) > thresholds["channel_delta_for_color"]:
-                    colored += 1
-                if max(red, green, blue) - min(red, green, blue) > thresholds["grayscale_mean_delta"]:
-                    grayscale = False
-            ratio = colored / len(pixels) if pixels else 0.0
+            analyzed_pixels = width * height
+            with warnings.catch_warnings():
+                # Pillow 14 will expose get_flattened_data; older supported
+                # versions only provide getdata and emit a forward-looking
+                # deprecation warning.  Iterating the imaging core retains
+                # constant Python-object memory instead of materializing one
+                # tuple and one list slot for every pixel.
+                warnings.simplefilter("ignore", category=DeprecationWarning)
+                for red, green, blue in composite.getdata():
+                    channel_min = min(red, green, blue)
+                    channel_delta = max(red, green, blue) - channel_min
+                    if channel_min < thresholds["nonwhite_channel_threshold"]:
+                        nonwhite += 1
+                    if channel_delta > thresholds["channel_delta_for_color"]:
+                        colored += 1
+                    if channel_delta > thresholds["grayscale_mean_delta"]:
+                        grayscale = False
+            ratio = colored / analyzed_pixels if analyzed_pixels else 0.0
             return {
                 "format": (source.format or "").lower() or None,
                 "mode": source.mode,
@@ -72,7 +85,15 @@ def analyze_image(data: bytes) -> dict[str, Any]:
                 "has_alpha": "A" in source.getbands(),
                 "is_probably_grayscale": grayscale,
                 "colored_nonwhite_pixel_ratio": ratio,
-                "nonwhite_pixel_ratio": nonwhite / len(pixels) if pixels else 0.0,
+                "nonwhite_pixel_ratio": nonwhite / analyzed_pixels if analyzed_pixels else 0.0,
+                "analysis": {
+                    "original_dimensions": [width, height],
+                    "sampled_dimensions": [width, height],
+                    "sampling_strategy": "full_scan_streaming",
+                    "analyzed_pixel_count": analyzed_pixels,
+                    "confidence": 1.0,
+                    "limitation": None,
+                },
                 "thresholds": thresholds,
             }
     except DocxInspectionError:
@@ -110,20 +131,25 @@ def inspect_images(package: DocxPackage, paragraph_ids: dict[int, str], paragrap
                 relation = relationships.get(relationship_id or "")
                 if relation is None or not relation.rel_type.endswith("/image"):
                     continue
-                media_part = package.resolve_target("word/document.xml", relation.target)
-                data = package.read(media_part) if relation.target_mode != "External" else None
+                external = relation.target_mode == "External"
+                media_part = (
+                    None
+                    if external
+                    else package.resolve_target("word/document.xml", relation.target)
+                )
+                data = package.read(media_part) if media_part is not None else None
                 analysis = analyze_image(data) if data is not None else {
                     "is_probably_grayscale": None,
                     "colored_nonwhite_pixel_ratio": None,
                     "thresholds": {},
                     "external": True,
                 }
-                images.append({
+                image_record = {
                     "id": f"img-{len(images):06d}",
                     "paragraph_id": paragraph_id,
                     "relationship_id": relationship_id,
-                    "media_part": media_part if relation.target_mode != "External" else relation.target,
-                    "file_type": package.content_type(media_part) if relation.target_mode != "External" else None,
+                    "media_part": media_part,
+                    "file_type": package.content_type(media_part) if media_part is not None else None,
                     "placement": placement,
                     "inline": placement == "inline",
                     "anchor": placement == "anchor",
@@ -133,7 +159,20 @@ def inspect_images(package: DocxPackage, paragraph_ids: dict[int, str], paragrap
                     "display_height_pt": display_height / 12700 if display_height is not None else None,
                     "color_analysis": analysis,
                     "caption_candidates": [],
-                })
+                }
+                if external:
+                    image_record.update(
+                        {
+                            "external": True,
+                            "external_target_sha256": hashlib.sha256(
+                                relation.target.encode("utf-8")
+                            ).hexdigest(),
+                            "external_target_preview": _external_target_preview(
+                                relation.target
+                            ),
+                        }
+                    )
+                images.append(image_record)
     # Associate nearby short caption paragraphs without changing paragraph
     # semantics; this is evidence only, never a classifier decision.
     ordered = list(paragraph_texts.items())

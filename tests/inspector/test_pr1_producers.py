@@ -164,7 +164,7 @@ def test_numbering_is_resolved_from_paragraph_style_and_based_on_chain(tmp_path:
         )
     )
     numbering = numbering_xml(
-        '<w:abstractNum xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum>',
+        '<w:abstractNum xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/><w:pStyle w:val="ListBase"/></w:lvl></w:abstractNum>',
         nums='<w:num xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" w:numId="4"><w:abstractNumId w:val="0"/></w:num>',
     )
     report = inspect_docx(
@@ -182,6 +182,15 @@ def test_numbering_is_resolved_from_paragraph_style_and_based_on_chain(tmp_path:
         "format": "decimal",
         "text": "%1.",
         "resolved": True,
+        "numbered": True,
+        "removes_numbering": False,
+        "level_source": "abstract_pStyle",
+        "level_evidence": {
+            "style_id": "ListBase",
+            "style_chain": ["ListChild", "ListBase"],
+            "abstract_num_id": 0,
+            "ilvl": 0,
+        },
         "source": "basedOn:ListBase",
     }
 

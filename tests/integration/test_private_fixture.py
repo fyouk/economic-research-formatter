@@ -115,7 +115,6 @@ def test_private_fixture_required_audit_conclusions(private_audit):
         "ER-MS-TITLE-001",
         "ER-MS-ABSTRACT-001",
         "ER-MS-HEADING1-001",
-        "ER-MS-HEADING-HIERARCHY-001",
         "ER-MS-FIGURE-001",
         "ER-MS-REF-LAYOUT-001",
         "ER-MS-REF-PAGERANGE-001",
@@ -127,6 +126,11 @@ def test_private_fixture_required_audit_conclusions(private_audit):
     }
     for rule_id in required_errors:
         assert "ERROR" in statuses_by_rule[rule_id]
+
+    # The fixed paper's visible hierarchy is still actionable, but the
+    # underlying numbering evidence is unresolved under the PR2 semantics.
+    # Unknown structure must not be promoted to a deterministic violation.
+    assert statuses_by_rule["ER-MS-HEADING-HIERARCHY-001"] == {"MANUAL_REVIEW"}
 
     assert statuses_by_rule["ER-MS-EQUATION-001"] == {"PASS"}
     assert "MANUAL_REVIEW" in statuses_by_rule["ER-MS-FIGURE-002"]
@@ -281,3 +285,21 @@ def test_private_tables_feed_latin_font_and_note_binding_from_inspector(
     assert all(candidate["table_id"] and candidate["paragraph_id"] for candidate in candidates)
     assert all(candidate["distance"] == 1 for candidate in candidates)
     assert all(candidate["reason"] == "first_nonempty_post_table_note" for candidate in candidates)
+
+
+def test_private_outputs_are_byte_deterministic_and_input_is_unchanged(
+    private_fixture,
+    private_analysis_inspection,
+    private_audit,
+):
+    before = (private_fixture.stat().st_mtime_ns, private_fixture.read_bytes())
+    repeated_inspection = inspect_docx(private_fixture, include_text=True)
+    repeated_audit = lint_inspection(repeated_inspection)
+    after = (private_fixture.stat().st_mtime_ns, private_fixture.read_bytes())
+
+    def serialized(value: dict) -> bytes:
+        return json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8")
+
+    assert serialized(repeated_inspection) == serialized(private_analysis_inspection)
+    assert serialized(repeated_audit) == serialized(private_audit)
+    assert after == before

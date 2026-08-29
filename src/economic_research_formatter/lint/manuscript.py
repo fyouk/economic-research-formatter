@@ -10,6 +10,7 @@ from collections.abc import Mapping, Sequence
 import re
 from typing import Any
 
+from economic_research_formatter.models.numbering import numbering_state
 
 from .common import (
     RuleContext,
@@ -22,6 +23,8 @@ from .common import (
     has_formatting_evidence,
     meaningful_runs,
     mismatch_message,
+    note_info,
+    note_linkage_issues,
     observed_formatting,
     paragraph_value,
     paragraph_target,
@@ -57,6 +60,223 @@ MS_RULE_IDS = {
     "ER-MS-REF-AUTHOR-001",
     "ER-MS-REF-JOURNAL-001",
 }
+
+
+_FORMAT_FONT_FIELDS = {
+    "east_asia_font": "eastAsia",
+    "ascii_font": "ascii",
+    "hansi_font": "hAnsi",
+}
+_UNKNOWN_FORMAT_STATUS_VALUES = {
+    "unknown",
+    "unresolved",
+    "unavailable",
+    "missing",
+    "insufficient_evidence",
+}
+
+
+def _formatting_envelopes(paragraph: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Collect known Inspector formatting envelopes without guessing fields."""
+
+    envelopes: list[Mapping[str, Any]] = []
+    if not isinstance(paragraph, Mapping):
+        return envelopes
+    envelopes.append(paragraph)
+    for key in ("formatting", "effective_formatting", "formatting_evidence", "formatting_observed"):
+        value = paragraph.get(key)
+        if isinstance(value, Mapping):
+            envelopes.append(value)
+    runs = paragraph.get("runs")
+    if isinstance(runs, Sequence) and not isinstance(runs, (str, bytes)):
+        for run in runs:
+            if not isinstance(run, Mapping):
+                continue
+            envelopes.append(run)
+            for key in ("formatting", "effective_formatting", "formatting_evidence", "formatting_observed"):
+                value = run.get(key)
+                if isinstance(value, Mapping):
+                    envelopes.append(value)
+    return envelopes
+
+
+def _unresolved_formatting_fields(
+    paragraph: Mapping[str, Any], requirement: Mapping[str, Any]
+) -> list[str]:
+    """Return required font fields occupied by unresolved theme evidence.
+
+    ``common.format_mismatches`` intentionally treats a missing observed value
+    as a mismatch for ordinary absent evidence.  Theme tokens are different:
+    the Inspector has positively observed a value, but cannot resolve its
+    concrete face.  This adapter keeps that distinction local to the
+    manuscript rules without weakening ordinary missing-field checks.
+    """
+
+    required = {
+        canonical: attribute
+        for canonical, attribute in _FORMAT_FONT_FIELDS.items()
+        if canonical in requirement
+    }
+    if not required:
+        return []
+    unresolved: set[str] = set()
+    for envelope in _formatting_envelopes(paragraph):
+        source = envelope.get("source")
+        source_font = source.get("font") if isinstance(source, Mapping) else None
+        if not isinstance(source_font, Mapping):
+            source_font = {}
+        effective = envelope.get("effective")
+        effective = effective if isinstance(effective, Mapping) else envelope
+        font = effective.get("font") if isinstance(effective, Mapping) else None
+        font = font if isinstance(font, Mapping) else {}
+        theme_evidence = font.get("theme_evidence")
+        theme_evidence = theme_evidence if isinstance(theme_evidence, Mapping) else {}
+        theme_tokens = font.get("theme")
+        theme_tokens = theme_tokens if isinstance(theme_tokens, Mapping) else {}
+        for canonical, attribute in required.items():
+            evidence = theme_evidence.get(attribute)
+            source_value = source_font.get(attribute)
+            resolved_value = font.get(attribute)
+            if source_value is not None and str(source_value).strip().casefold() in _UNKNOWN_FORMAT_STATUS_VALUES:
+                unresolved.add(canonical)
+            if isinstance(evidence, Mapping) and evidence.get("resolved") is False:
+                unresolved.add(canonical)
+            if isinstance(resolved_value, Mapping):
+                status = str(resolved_value.get("status", "")).strip().casefold().replace("-", "_")
+                if status in _UNKNOWN_FORMAT_STATUS_VALUES:
+                    unresolved.add(canonical)
+            # A few producer versions expose only the token and source, not the
+            # nested evidence envelope.  A concrete value of ``None`` together
+            # with that explicit token is still unresolved, never a violation.
+            if attribute in theme_tokens and effective.get(attribute) is None:
+                unresolved.add(canonical)
+    return sorted(unresolved)
+
+
+def _mark_unresolved_formatting(
+    checked: Mapping[str, Any] | None,
+    paragraph: Mapping[str, Any],
+    requirement: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Annotate unresolved theme fields as unchecked/manual-review evidence."""
+
+    fields = _unresolved_formatting_fields(paragraph, requirement)
+    if not fields:
+        return dict(checked) if isinstance(checked, Mapping) else None
+    if isinstance(checked, Mapping):
+        observed = dict(checked.get("observed", {}))
+        mismatches = dict(checked.get("mismatches", {}))
+        unchecked = set(checked.get("unchecked", []))
+    else:
+        observed = observed_formatting(paragraph)
+        mismatches = {}
+        unchecked = set()
+    observed["unresolved_formatting_fields"] = fields
+    resolved_mismatch_fields: set[str] = set()
+    run_mismatches = mismatches.get("runs")
+    if isinstance(run_mismatches, Sequence) and not isinstance(run_mismatches, (str, bytes)):
+        runs = meaningful_runs(paragraph)
+        filtered = []
+        for item in run_mismatches:
+            if not isinstance(item, Mapping):
+                filtered.append(item)
+                continue
+            field = str(item.get("field", ""))
+            if field not in fields:
+                filtered.append(item)
+                continue
+            try:
+                run_index = int(item.get("index"))
+            except (TypeError, ValueError):
+                continue
+            if not 0 <= run_index < len(runs):
+                continue
+            run_unresolved = set(_unresolved_formatting_fields(runs[run_index], requirement))
+            if field in run_unresolved:
+                continue
+            filtered.append(item)
+            resolved_mismatch_fields.add(field)
+        if filtered:
+            mismatches["runs"] = filtered
+        else:
+            mismatches.pop("runs", None)
+    manual_fields = set(fields) - resolved_mismatch_fields
+    unchecked.update(manual_fields)
+    for field in manual_fields:
+        # A missing value caused only by unresolved theme evidence must not
+        # remain in the deterministic-violation bucket.
+        mismatches.pop(field, None)
+    return {
+        "observed": observed,
+        "mismatches": mismatches,
+        "unchecked": sorted(unchecked),
+    }
+
+
+def _missing_formatting_fields(
+    paragraph: Mapping[str, Any], requirement: Mapping[str, Any]
+) -> list[str]:
+    """Return required font fields for which no concrete evidence exists."""
+
+    unresolved = set(_unresolved_formatting_fields(paragraph, requirement))
+    missing: list[str] = []
+    for canonical in _FORMAT_FONT_FIELDS:
+        if canonical not in requirement or canonical in unresolved:
+            continue
+        if paragraph_value(paragraph, canonical) is None:
+            missing.append(canonical)
+    return missing
+
+
+def _numbering_mapping(paragraph: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    for key in ("numbering", "numPr"):
+        value = paragraph.get(key)
+        if isinstance(value, Mapping):
+            return value
+    return None
+
+
+def _mark_numbering_evidence(
+    checked: Mapping[str, Any] | None,
+    paragraph: Mapping[str, Any],
+    requirement: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Use producer numbering state instead of truthiness of a mapping."""
+
+    if "numbered" not in requirement:
+        return dict(checked) if isinstance(checked, Mapping) else None
+    numbering = _numbering_mapping(paragraph)
+    if numbering is None:
+        return dict(checked) if isinstance(checked, Mapping) else None
+
+    numbered = numbering_state(numbering)
+    removes = _as_bool(numbering.get("removes_numbering"))
+    resolved = _as_bool(numbering.get("resolved"))
+    expected = bool(requirement.get("numbered"))
+    if isinstance(checked, Mapping):
+        observed = dict(checked.get("observed", {}))
+        mismatches = dict(checked.get("mismatches", {}))
+        unchecked = set(checked.get("unchecked", []))
+    else:
+        observed = observed_formatting(paragraph)
+        mismatches = {}
+        unchecked = set()
+    observed["numbered"] = numbered
+    observed["numbering_evidence"] = {
+        "numbered": numbered,
+        "removes_numbering": removes,
+        "resolved": resolved,
+    }
+    mismatches.pop("numbered", None)
+    if numbered is None:
+        unchecked.add("numbered")
+    elif numbered != expected:
+        mismatches["numbered"] = {"observed": numbered, "expected": expected}
+    return {
+        "observed": observed,
+        "mismatches": mismatches,
+        "unchecked": sorted(unchecked),
+    }
 
 
 def _document_or_first(rule: Mapping[str, Any], ctx: RuleContext, paragraphs: Sequence[Mapping[str, Any]], message: str) -> dict[str, Any]:
@@ -99,6 +319,8 @@ def _format_targets(
             )
             continue
         checked = check_paragraph_format(rule, paragraph, role=role)
+        checked = _mark_numbering_evidence(checked, paragraph, expected_for(rule))
+        checked = _mark_unresolved_formatting(checked, paragraph, expected_for(rule))
         if checked:
             if is_note:
                 missing_size_or_font = []
@@ -126,7 +348,18 @@ def _format_targets(
                         )
                     )
                     continue
-            if checked.get("unchecked"):
+            if checked.get("mismatches"):
+                results.append(
+                    finding(
+                        rule,
+                        rule_severity(rule),
+                        mismatch_message(rule, checked["mismatches"]),
+                        paragraph=paragraph,
+                        target=paragraph_target(paragraph, role),
+                        observed=checked["observed"],
+                    )
+                )
+            elif checked.get("unchecked"):
                 results.append(
                     finding(
                         rule,
@@ -141,8 +374,8 @@ def _format_targets(
                 results.append(
                     finding(
                         rule,
-                        rule_severity(rule),
-                        mismatch_message(rule, checked["mismatches"]),
+                        "PASS",
+                        f"{rule.get('target', '目标')}已满足规则要求。",
                         paragraph=paragraph,
                         target=paragraph_target(paragraph, role),
                         observed=checked["observed"],
@@ -268,12 +501,17 @@ def _classify_title_marker_reference(reference: Any, expected_marker: str) -> di
         "status": "unknown",
         "reason": "marker_not_exposed",
     }
+    if custom is not None:
+        result["custom_mark_follows"] = custom
     if value is not None:
         key, glyph = value
         result["marker"] = glyph
         result["marker_source"] = key
-        if glyph == expected_marker and (custom is not False or key in {"literal_marker", "marker_glyph", "marker"}):
+        if glyph == expected_marker and custom is True:
             result.update(status="pass", reason="associated_custom_marker")
+            return result
+        if glyph == expected_marker and custom is None:
+            result.update(reason="marker_without_custom_mark_evidence")
             return result
         result.update(status="wrong", reason="associated_nonmatching_marker")
         return result
@@ -496,23 +734,31 @@ def _heading_has_independent_level_evidence(paragraph: Mapping[str, Any]) -> boo
     if paragraph.get("outline_level") is not None:
         return True
     numbering = paragraph.get("numbering") or paragraph.get("numPr")
-    return isinstance(numbering, Mapping) and any(
-        numbering.get(key) is not None for key in ("ilvl", "level", "outline_level")
-    )
+    if not isinstance(numbering, Mapping):
+        return False
+    if numbering_state(numbering) is not True:
+        return False
+    return any(numbering.get(key) is not None for key in ("ilvl", "level", "outline_level"))
 
 
 def _visible_only_level_jump(targets: Sequence[Mapping[str, Any]], ctx: RuleContext) -> bool:
     """Return whether visible markers leave a non-adjacent hierarchy jump."""
 
-    if not targets or any(_heading_has_independent_level_evidence(item) for item in targets):
+    if not targets:
         return False
-    levels: list[int] = []
+    levels: list[tuple[int, bool]] = []
     for paragraph in targets:
         role = ctx.role(paragraph)
         suffix = role.rsplit("_", 1)[-1]
         if suffix.isdigit():
-            levels.append(int(suffix))
-    return any(abs(current - previous) > 1 for previous, current in zip(levels, levels[1:]))
+            levels.append((int(suffix), _heading_has_independent_level_evidence(paragraph)))
+    return any(
+        abs(current_level - previous_level) > 1
+        and not (previous_independent and current_independent)
+        for (previous_level, previous_independent), (current_level, current_independent) in zip(
+            levels, levels[1:]
+        )
+    )
 
 
 def _hierarchy(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, Any]]:
@@ -771,6 +1017,7 @@ def _normalize_restart(value: Any) -> str | None:
         "page": "each_page",
         "restartpage": "each_page",
         "eachsection": "each_section",
+        "eachsect": "each_section",
         "section": "each_section",
         "continuous": "continuous",
     }.get(compact)
@@ -778,6 +1025,17 @@ def _normalize_restart(value: Any) -> str | None:
 
 def _restart_values(info: Mapping[str, Any], inspection: Mapping[str, Any]) -> list[Any]:
     """Collect effective restart values from the note report and sections."""
+
+    if "num_restarts" in info:
+        effective = info.get("num_restarts")
+        if isinstance(effective, Sequence) and not isinstance(effective, (str, bytes)):
+            return [value for value in effective if value is not None]
+        return [effective] if effective is not None else []
+    if "num_restart" in info:
+        effective = info.get("num_restart")
+        if isinstance(effective, Sequence) and not isinstance(effective, (str, bytes)):
+            return [value for value in effective if value is not None]
+        return [effective] if effective is not None else []
 
     values: list[Any] = []
     restart_keys = {
@@ -829,6 +1087,113 @@ def _restart_values(info: Mapping[str, Any], inspection: Mapping[str, Any]) -> l
     return values
 
 
+def _footnote_reference_restart_evidence(
+    inspection: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Return one effective restart record per concrete footnote reference."""
+
+    paragraphs = inspection.get("paragraphs", [])
+    ordered_records: list[tuple[tuple[Any, ...], Mapping[str, Any]]] = []
+    if isinstance(paragraphs, Sequence) and not isinstance(paragraphs, (str, bytes)):
+        for value in paragraphs:
+            if not isinstance(value, Mapping):
+                continue
+            ordered_records.append(
+                (
+                    (value.get("body_order", 10**12), 0, value.get("index", 10**12)),
+                    value,
+                )
+            )
+    tables = inspection.get("tables", [])
+    if isinstance(tables, Sequence) and not isinstance(tables, (str, bytes)):
+        for table in tables:
+            if not isinstance(table, Mapping):
+                continue
+            cells = table.get("cells", [])
+            if not isinstance(cells, Sequence) or isinstance(cells, (str, bytes)):
+                continue
+            for cell in cells:
+                if not isinstance(cell, Mapping):
+                    continue
+                values = cell.get("paragraphs", [])
+                if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
+                    for value in values:
+                        if not isinstance(value, Mapping):
+                            continue
+                        ordered_records.append(
+                            (
+                                (
+                                    table.get("body_order", 10**12),
+                                    1,
+                                    cell.get("row", 10**12),
+                                    cell.get("column", 10**12),
+                                    value.get("index", 10**12),
+                                ),
+                                value,
+                            )
+                        )
+    paragraph_records = []
+    for order, value in sorted(ordered_records, key=lambda item: item[0]):
+        record = dict(value)
+        record["_story_order"] = order
+        record["_story_index"] = order[0]
+        paragraph_records.append(record)
+    result: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for raw_paragraph in paragraph_records:
+        paragraph_id = str(raw_paragraph.get("id", ""))
+        values = raw_paragraph.get("footnote_reference_evidence", [])
+        if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+            values = []
+        for reference_index, raw_reference in enumerate(values):
+            if not isinstance(raw_reference, Mapping):
+                continue
+            note_id = raw_reference.get("reference_id", raw_reference.get("id"))
+            run_index = raw_reference.get("run_index", reference_index)
+            identity = (paragraph_id, str(note_id), str(run_index))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            effective = raw_reference.get("effective_properties")
+            if not isinstance(effective, Mapping):
+                note_properties = raw_reference.get("note_properties")
+                note_properties = note_properties if isinstance(note_properties, Mapping) else {}
+                effective = note_properties.get("effective_properties")
+                if not isinstance(effective, Mapping):
+                    effective = note_properties
+            property_evidence = raw_reference.get("property_evidence")
+            if not isinstance(property_evidence, Mapping):
+                note_properties = raw_reference.get("note_properties")
+                note_properties = note_properties if isinstance(note_properties, Mapping) else {}
+                property_evidence = note_properties.get("property_evidence", {})
+            section_index = raw_reference.get(
+                "section_index", raw_paragraph.get("section_index")
+            )
+            result.append(
+                {
+                    "target": {
+                        "kind": "footnote_reference",
+                        "id": (
+                            f"{paragraph_id}-footnote-{note_id}-run-{run_index}"
+                            if paragraph_id
+                            else f"footnote-{note_id}-reference-{reference_index}"
+                        ),
+                        "paragraph_id": paragraph_id or None,
+                        "source_id": f"footnote-{note_id}",
+                        "note_id": note_id,
+                        "footnote_id": note_id,
+                        "index": raw_paragraph.get("_story_index"),
+                        "story_order": list(raw_paragraph.get("_story_order", ())),
+                        "section_index": section_index,
+                        "run_index": run_index,
+                    },
+                    "restart": effective.get("numRestart"),
+                    "property_evidence": dict(property_evidence),
+                }
+            )
+    return result
+
+
 def _footnote_numbering(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, Any]]:
     info = footnote_info(ctx.inspection)
     count = info.get("actual_count", info.get("count", 0))
@@ -836,10 +1201,86 @@ def _footnote_numbering(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[
         count = int(count or 0)
     except (TypeError, ValueError):
         count = 0
+    linkage_issues = note_linkage_issues(ctx.inspection, ("footnote",))
+    linkage_findings = (
+        [
+            finding(
+                rule,
+                "MANUAL_REVIEW",
+                "正文脚注引用与脚注定义无法一一对应。",
+                target=ctx.document_target,
+                observed={"note_linkage_issues": linkage_issues},
+            )
+        ]
+        if linkage_issues
+        else []
+    )
+    active_reference_ids = {
+        str(value)
+        for issue in linkage_issues
+        for value in issue.get("active_reference_ids", [])
+    }
     if count == 0:
+        if linkage_findings:
+            return linkage_findings
         return [finding(rule, "NOT_APPLICABLE", "文档没有实际脚注；分隔符不计入脚注。", target=ctx.document_target)]
     requirement = expected_for(rule)
     expected_restart = requirement.get("restart")
+    expected = _normalize_restart(expected_restart)
+    reference_records = _footnote_reference_restart_evidence(ctx.inspection)
+    if linkage_issues:
+        reference_records = [
+            record
+            for record in reference_records
+            if str(record.get("target", {}).get("footnote_id"))
+            in active_reference_ids
+        ]
+        unique_records: list[dict[str, Any]] = []
+        seen_active_ids: set[str] = set()
+        for record in reference_records:
+            active_id = str(record.get("target", {}).get("footnote_id"))
+            if active_id in seen_active_ids:
+                continue
+            seen_active_ids.add(active_id)
+            unique_records.append(record)
+        reference_records = unique_records
+    if reference_records:
+        results: list[dict[str, Any]] = []
+        for record in reference_records:
+            raw_restart = record["restart"]
+            normalized = _normalize_restart(raw_restart)
+            observed = {
+                "restart": raw_restart,
+                "restart_normalized": normalized,
+                "restarts": [raw_restart] if raw_restart is not None else [],
+                "restarts_normalized": [normalized] if normalized is not None else [],
+                "section_index": record["target"].get("section_index"),
+                "property_evidence": record["property_evidence"],
+            }
+            if raw_restart is None or expected is None:
+                status = "MANUAL_REVIEW"
+                message = "脚注引用缺少可判定的有效编号重启证据。"
+            elif normalized is None:
+                status = "MANUAL_REVIEW"
+                message = "脚注引用的编号重启证据无法解释，需人工确认。"
+            elif normalized != expected:
+                status = rule_severity(rule)
+                message = "该脚注引用所属节的编号重启方式不符合要求。"
+            else:
+                status = "PASS"
+                message = "该脚注引用所属节的编号重启方式符合要求。"
+            results.append(
+                finding(
+                    rule,
+                    status,
+                    message,
+                    target=record["target"],
+                    observed=observed,
+                )
+            )
+        return [*results, *linkage_findings]
+    if linkage_findings:
+        return linkage_findings
     raw_restarts = _restart_values(info, ctx.inspection)
     normalized = [_normalize_restart(value) for value in raw_restarts]
     observed = {
@@ -847,7 +1288,6 @@ def _footnote_numbering(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[
         "restarts_normalized": normalized,
         "actual_count": count,
     }
-    expected = _normalize_restart(expected_restart)
     if not raw_restarts or expected is None:
         return [finding(rule, "MANUAL_REVIEW", "检测到实际脚注，但缺少可判定的编号重启证据。", target=ctx.document_target, observed=observed)]
     if any(value is None for value in normalized):
@@ -866,7 +1306,23 @@ def _footnote_text(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, 
         count = int(count or 0)
     except (TypeError, ValueError):
         count = 0
+    linkage_issues = note_linkage_issues(ctx.inspection, ("footnote",))
+    linkage_findings = (
+        [
+            finding(
+                rule,
+                "MANUAL_REVIEW",
+                "正文脚注引用与脚注定义无法一一对应。",
+                target=ctx.document_target,
+                observed={"note_linkage_issues": linkage_issues},
+            )
+        ]
+        if linkage_issues
+        else []
+    )
     if count == 0:
+        if linkage_findings:
+            return linkage_findings
         return [finding(rule, "NOT_APPLICABLE", "文档没有实际脚注；分隔符不计入脚注。", target=ctx.document_target)]
     targets = [
         paragraph
@@ -880,8 +1336,13 @@ def _footnote_text(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, 
             target.setdefault("id", f"footnote-{target.get('id', index)}")
             target.setdefault("kind", "footnote")
     if not targets:
+        if linkage_findings:
+            return linkage_findings
         return [finding(rule, "MANUAL_REVIEW", "检测到实际脚注，但脚注正文格式未在 Inspector 输出中提供。", target=ctx.document_target, observed={"actual_count": count})]
-    return _format_targets(rule, ctx, targets, missing_message="未提供脚注正文。")
+    return [
+        *_format_targets(rule, ctx, targets, missing_message="未提供脚注正文。"),
+        *linkage_findings,
+    ]
 
 
 def _figure_color(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, Any]]:
@@ -935,30 +1396,55 @@ def _latin_font(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, Any
     targets: list[tuple[Mapping[str, Any], float, str]] = []
     seen_ids: set[tuple[str, str]] = set()
     nested_note_ids: set[str] = set()
+    linkage_issues = note_linkage_issues(ctx.inspection)
+    linkage_by_kind = {
+        str(issue.get("kind")): issue
+        for issue in linkage_issues
+        if issue.get("kind")
+    }
 
     # Prefer note-part paragraphs when available.  ``RuleContext`` also keeps
     # one compatibility-level item per note; skipping that envelope avoids a
     # duplicate finding for every nested footnote paragraph.
-    note_info = footnote_info(ctx.inspection)
-    raw_note_items = note_info.get("items", note_info.get("paragraphs", []))
-    if isinstance(raw_note_items, Sequence) and not isinstance(raw_note_items, (str, bytes)):
+    for note_kind in ("footnote", "endnote"):
+        collection = note_info(ctx.inspection, note_kind)
+        raw_note_items = collection.get("items", collection.get("paragraphs", []))
+        if not isinstance(raw_note_items, Sequence) or isinstance(raw_note_items, (str, bytes)):
+            continue
         for note_index, raw_note in enumerate(raw_note_items):
             if not isinstance(raw_note, Mapping):
                 continue
-            note_id = str(raw_note.get("id", note_index))
+            raw_note_id = raw_note.get(f"{note_kind}_id", raw_note.get("note_id", raw_note.get("id", note_index)))
+            linkage = linkage_by_kind.get(note_kind)
+            if linkage is not None:
+                active_note_ids = {
+                    str(value)
+                    for value in linkage.get("active_note_ids", [])
+                }
+                if not linkage.get("has_reference_evidence") or str(raw_note_id) not in active_note_ids:
+                    continue
+            note_id = str(raw_note_id)
             nested = raw_note.get("paragraphs", [])
             if not isinstance(nested, Sequence) or isinstance(nested, (str, bytes)) or not nested:
                 continue
-            for paragraph_index, raw_paragraph in enumerate(nested):
-                if not isinstance(raw_paragraph, Mapping):
-                    continue
+            nested_paragraphs = [
+                raw_paragraph
+                for raw_paragraph in nested
+                if isinstance(raw_paragraph, Mapping)
+            ]
+            if not nested_paragraphs:
+                continue
+            nested_note_ids.add(f"{note_kind}-{note_id}")
+            for paragraph_index, raw_paragraph in enumerate(nested_paragraphs):
                 paragraph = dict(raw_paragraph)
-                paragraph.setdefault("id", f"footnotes-{note_id}-p-{paragraph_index:04d}")
+                paragraph.setdefault("id", f"{note_kind}s-{note_id}-p-{paragraph_index:04d}")
                 paragraph.setdefault("index", paragraph_index)
-                paragraph.setdefault("kind", "footnote")
-                paragraph.setdefault("footnote_id", raw_note.get("id", note_index))
-                nested_note_ids.add(f"footnote-{note_id}")
-                _append_latin_target(targets, seen_ids, paragraph, 0.99, "footnote")
+                paragraph.setdefault("kind", note_kind)
+                paragraph.setdefault("note_id", raw_note_id)
+                paragraph.setdefault(f"{note_kind}_id", raw_note_id)
+                if not text_has_latin_or_digit(text_of(paragraph)):
+                    continue
+                _append_latin_target(targets, seen_ids, paragraph, 0.99, note_kind)
 
     for paragraph in ctx.paragraph_list:
         kind = str(paragraph.get("kind", "")).casefold()
@@ -967,40 +1453,96 @@ def _latin_font(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, Any
         text = text_of(paragraph)
         if not text_has_latin_or_digit(text):
             continue
-        scope = "footnote" if kind in {"footnote", "ordinary_footnote", "endnote"} else "body"
+        scope = kind if kind in {"footnote", "endnote"} else "footnote" if kind == "ordinary_footnote" else "body"
         _append_latin_target(targets, seen_ids, paragraph, 0.99 if meaningful_runs(paragraph) else 0.80, scope)
     for paragraph in ctx.table_paragraphs():
         if text_has_latin_or_digit(text_of(paragraph)):
             _append_latin_target(targets, seen_ids, paragraph, 0.99 if meaningful_runs(paragraph) else 0.80, "table")
     if not targets:
+        if linkage_issues:
+            return [
+                finding(
+                    rule,
+                    "MANUAL_REVIEW",
+                    "脚注或尾注定义与正文引用无法一一对应，相关字体证据需人工复核。",
+                    target=ctx.document_target,
+                    observed={"note_linkage_issues": linkage_issues},
+                    confidence=0.40,
+                )
+            ]
         return [finding(rule, "NOT_APPLICABLE", "文档中没有可检查的英文字母或数字。", target=ctx.document_target)]
     results: list[dict[str, Any]] = []
+    if linkage_issues:
+        results.append(
+            finding(
+                rule,
+                "MANUAL_REVIEW",
+                "脚注或尾注定义与正文引用无法一一对应；仅对已绑定目标继续检查。",
+                target=ctx.document_target,
+                observed={"note_linkage_issues": linkage_issues},
+                confidence=0.40,
+            )
+        )
     for paragraph, confidence, scope in targets:
         mismatches: dict[str, Any] = {}
         observed: dict[str, Any] = {"scope": scope, "font_runs": []}
+        unresolved_field_set: set[str] = set()
         runs = meaningful_runs(paragraph)
         for run in runs or [paragraph]:
             run_text = text_of(run)
             if not text_has_latin_or_digit(run_text or text_of(paragraph)):
                 continue
+            run_unresolved = set(_unresolved_formatting_fields(run, requirement))
+            unresolved_field_set.update(run_unresolved)
             actual_ascii = run_value(run, "ascii_font")
             actual_hansi = run_value(run, "hansi_font")
             run_observed = {"ascii_font": actual_ascii, "hansi_font": actual_hansi}
+            if run_unresolved:
+                run_observed["unresolved_formatting_fields"] = sorted(run_unresolved)
             observed["font_runs"].append(run_observed)
             observed.setdefault("ascii_font", actual_ascii)
             observed.setdefault("hansi_font", actual_hansi)
-            if not _font_equal(actual_ascii, requirement.get("ascii_font")):
+            if (
+                "ascii_font" not in run_unresolved
+                and not _font_equal(actual_ascii, requirement.get("ascii_font"))
+            ):
                 mismatches.setdefault("ascii_font", {"observed": actual_ascii, "expected": requirement.get("ascii_font")})
-            if not _font_equal(actual_hansi, requirement.get("hansi_font")):
+            if (
+                "hansi_font" not in run_unresolved
+                and not _font_equal(actual_hansi, requirement.get("hansi_font"))
+            ):
                 mismatches.setdefault("hansi_font", {"observed": actual_hansi, "expected": requirement.get("hansi_font")})
+        unresolved_fields = sorted(unresolved_field_set)
+        if unresolved_fields:
+            observed["unresolved_formatting_fields"] = unresolved_fields
         target = paragraph_target(paragraph, ctx.role(paragraph))
         if scope != "body":
             target["scope"] = scope
-            for key in ("table_id", "table_index", "cell_id", "cell_index", "footnote_id"):
+            for key in (
+                "table_id",
+                "table_index",
+                "cell_id",
+                "cell_index",
+                "note_id",
+                "footnote_id",
+                "endnote_id",
+            ):
                 if paragraph.get(key) is not None:
                     target[key] = paragraph[key]
         if mismatches:
             results.append(finding(rule, rule_severity(rule), "英文字母或数字字体不符合规则要求。", target=target, paragraph=paragraph, observed=observed, confidence=confidence))
+        elif unresolved_fields:
+            results.append(
+                finding(
+                    rule,
+                    "MANUAL_REVIEW",
+                    "英文字体包含无法解析的 theme evidence，当前需人工复核。",
+                    target=target,
+                    paragraph=paragraph,
+                    observed=observed,
+                    confidence=confidence,
+                )
+            )
         else:
             results.append(finding(rule, "PASS", "英文字母和数字字体符合规则。", target=target, paragraph=paragraph, observed=observed, confidence=confidence))
     return results
@@ -1275,6 +1817,16 @@ def _attach_table_relation_evidence(ctx: RuleContext, target: dict[str, Any], *,
             target["comparison_status"] = normalized or "unknown"
 
 
+def _table_finding_target(target: Mapping[str, Any], ctx: RuleContext) -> dict[str, Any]:
+    """Preserve the table/cell identity on findings emitted for table text."""
+
+    result = paragraph_target(target, ctx.role(target))
+    for key in ("table_id", "table_index", "cell_id", "cell_index", "table_note_candidate"):
+        if target.get(key) is not None:
+            result[key] = target[key]
+    return result
+
+
 def _inspector_table_note_targets(
     ctx: RuleContext, existing: Sequence[Mapping[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -1439,6 +1991,8 @@ def _table_rule(rule: Mapping[str, Any], ctx: RuleContext, *, notes: bool) -> li
     if not targets:
         return [finding(rule, "NOT_APPLICABLE", "未识别到表格内目标段落。", target=ctx.document_target)]
     relation_key = "font_size_relation_to_table" if notes else "font_size_relation_to_body"
+    requirement = expected_for(rule)
+    relation_required = relation_key in requirement
     results: list[dict[str, Any]] = []
     for target in targets:
         relation = paragraph_value(target, relation_key)
@@ -1449,7 +2003,10 @@ def _table_rule(rule: Mapping[str, Any], ctx: RuleContext, *, notes: bool) -> li
                 observed[key] = target[key]
         if relation is not None:
             observed[relation_key] = relation
-        if normalized in _UNKNOWN_RELATION_VALUES or target.get("comparison_status") in _UNKNOWN_RELATION_VALUES:
+        if relation_required and (
+            normalized in _UNKNOWN_RELATION_VALUES
+            or target.get("comparison_status") in _UNKNOWN_RELATION_VALUES
+        ):
             observed["comparison_status"] = normalized or target.get("comparison_status") or "unknown"
             if target.get("font_size_comparison") is not None:
                 observed["font_size_comparison"] = target["font_size_comparison"]
@@ -1459,13 +2016,29 @@ def _table_rule(rule: Mapping[str, Any], ctx: RuleContext, *, notes: bool) -> li
                     "MANUAL_REVIEW",
                     "表格字号比较证据显示混合/未知状态，当前需人工复核。",
                     paragraph=target,
-                    target=paragraph_target(target, ctx.role(target)),
+                    target=_table_finding_target(target, ctx),
+                    observed=observed,
+                    confidence=0.80,
+                )
+            )
+            continue
+        missing_fields = _missing_formatting_fields(target, requirement) if notes else []
+        if missing_fields:
+            observed["missing_formatting_evidence"] = missing_fields
+            results.append(
+                finding(
+                    rule,
+                    "MANUAL_REVIEW",
+                    "表格目标缺少规则要求的字体证据，当前需人工复核。",
+                    paragraph=target,
+                    target=_table_finding_target(target, ctx),
                     observed=observed,
                     confidence=0.80,
                 )
             )
             continue
         checked = check_paragraph_format(rule, target, role=ctx.role(target))
+        checked = _mark_unresolved_formatting(checked, target, requirement)
         if checked:
             if checked.get("unchecked"):
                 results.append(
@@ -1474,7 +2047,7 @@ def _table_rule(rule: Mapping[str, Any], ctx: RuleContext, *, notes: bool) -> li
                         "MANUAL_REVIEW",
                         "表格字号缺少 Inspector 产生的可验证比较关系，当前需人工复核。",
                         paragraph=target,
-                        target=paragraph_target(target, ctx.role(target)),
+                        target=_table_finding_target(target, ctx),
                         observed=checked["observed"],
                         confidence=0.80,
                     )
@@ -1486,7 +2059,7 @@ def _table_rule(rule: Mapping[str, Any], ctx: RuleContext, *, notes: bool) -> li
                         rule_severity(rule),
                         mismatch_message(rule, checked["mismatches"]),
                         paragraph=target,
-                        target=paragraph_target(target, ctx.role(target)),
+                        target=_table_finding_target(target, ctx),
                         observed=checked["observed"],
                     )
                 )
@@ -1497,7 +2070,7 @@ def _table_rule(rule: Mapping[str, Any], ctx: RuleContext, *, notes: bool) -> li
                     "PASS",
                     f"{rule.get('target', '目标')}已满足规则要求。",
                     paragraph=target,
-                    target=paragraph_target(target, ctx.role(target)),
+                    target=_table_finding_target(target, ctx),
                     observed=observed or {"formatting": True},
                 )
             )

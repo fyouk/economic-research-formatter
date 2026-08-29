@@ -170,9 +170,13 @@ def test_title_marker_collects_bound_reference_evidence_from_inspector_shapes() 
 
     finding = _finding(lint_inspection(inspection), "ER-MS-TITLE-002")
 
-    assert finding["status"] == "PASS"
+    assert finding["status"] == "MANUAL_REVIEW"
     assert len(finding["observed"]["footnote_reference_evidence"]) >= 5
-    assert all(item["status"] == "pass" for item in finding["observed"]["marker_evidence"])
+    assert all(item["status"] == "unknown" for item in finding["observed"]["marker_evidence"])
+    assert all(
+        item["reason"] == "marker_without_custom_mark_evidence"
+        for item in finding["observed"]["marker_evidence"]
+    )
 
 
 def test_author_information_term_prioritizes_disallowed_occurrence_across_paragraphs() -> None:

@@ -9,6 +9,7 @@ published audit schema.
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
@@ -36,6 +37,20 @@ _CONTENT_SNIPPET_KEYS = {
     "text",
     "text_excerpt",
     "text_preview",
+}
+
+
+_UNKNOWN_GROUP_VALUES = {
+    "",
+    "unknown",
+    "unresolved",
+    "unavailable",
+    "ambiguous",
+    "mixed",
+    "missing",
+    "insufficient_evidence",
+    "not_checked",
+    "not-checked",
 }
 
 
@@ -126,19 +141,43 @@ def make_finding(
 
 
 def target_for_paragraph(paragraph: Mapping[str, Any] | None, *, role: str | None = None) -> dict[str, Any]:
-    """Return a privacy-conscious target object for an inspected paragraph."""
+    """Return a privacy-conscious target while preserving note identity.
+
+    Note-part records have historically been passed through several envelopes
+    (raw item, normalized ``NoteTarget``, and classifier item).  Read the
+    nested target as a fallback, but never turn an endnote into a footnote or
+    discard its ``source_id``/numeric identity when a finding is constructed.
+    """
 
     paragraph = paragraph or {}
-    paragraph_kind = str(paragraph.get("kind", "")).casefold()
+    nested_target = paragraph.get("target")
+    nested_target = nested_target if isinstance(nested_target, Mapping) else {}
+    paragraph_kind = str(paragraph.get("kind") or nested_target.get("kind") or "").casefold()
+    note_kinds = {"footnote", "ordinary_footnote", "endnote"}
     target: dict[str, Any] = {
-        "kind": paragraph_kind if paragraph_kind in {"footnote", "ordinary_footnote", "endnote"} else "paragraph"
+        "kind": paragraph_kind if paragraph_kind in note_kinds else "paragraph"
     }
-    for key in ("id", "index", "text_preview"):
-        if key in paragraph:
-            value = paragraph[key]
+    # The outer normalized record wins over the nested target.  The latter is
+    # still consulted so a caller can pass a raw NoteTarget envelope directly.
+    for key in ("id", "index", "text_preview", "source_id", "note_id", "footnote_id", "endnote_id"):
+        value = paragraph.get(key)
+        if value is None:
+            value = nested_target.get(key)
+        if value is not None:
             target[key] = value[:_MAX_CONTENT_SNIPPET] if key == "text_preview" and isinstance(value, str) else value
-    if "text_preview" not in target and isinstance(paragraph.get("text"), str):
-        target["text_preview"] = paragraph["text"][:_MAX_CONTENT_SNIPPET]
+    if "text_preview" not in target:
+        text = paragraph.get("text", nested_target.get("text"))
+        if isinstance(text, str):
+            target["text_preview"] = text[:_MAX_CONTENT_SNIPPET]
+    # A normalized note item may carry only ``kind`` + numeric ID.  Fill the
+    # stable source ID deterministically rather than leaving consumers to
+    # reconstruct it differently.
+    if target["kind"] in note_kinds and target.get("source_id") is None:
+        note_id = target.get("note_id")
+        if note_id is None:
+            note_id = target.get(f"{target['kind']}_id")
+        if note_id is not None:
+            target["source_id"] = f"{target['kind']}-{note_id}"
     if role:
         target["role"] = role
     return target
@@ -164,6 +203,198 @@ def _message_for_group(group: Iterable[Mapping[str, Any]]) -> str:
     return ""
 
 
+def target_sort_key(value: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Return a deterministic key for targets with heterogeneous index types."""
+
+    target = value.get("target")
+    target = target if isinstance(target, Mapping) else {}
+    raw_index = target.get("index")
+    try:
+        index_key: tuple[int, Any] = (0, int(raw_index))
+    except (TypeError, ValueError, OverflowError):
+        index_key = (1, str(raw_index or ""))
+    return (*index_key, str(target.get("id", "")))
+
+
+def _is_table_unknown_finding(finding: Mapping[str, Any]) -> bool:
+    """Identify repeated table-level uncertainty suitable for compacting.
+
+    Only uncertainty findings are grouped.  A concrete table error remains a
+    normal per-target result because collapsing distinct violations would hide
+    an actionable location from the caller.
+    """
+
+    target = finding.get("target")
+    if not isinstance(target, Mapping) or target.get("table_id") is None:
+        return False
+    status = str(finding.get("status", "")).upper()
+    if status not in {"MANUAL_REVIEW", "NOT_CHECKED"}:
+        return False
+    observed = finding.get("observed")
+    observed = observed if isinstance(observed, Mapping) else {}
+
+    def contains_unknown(value: Any, key: str = "") -> bool:
+        normalized_key = key.casefold().replace("-", "_")
+        if isinstance(value, str):
+            normalized = value.strip().casefold().replace("-", "_").replace(" ", "_")
+            if normalized in _UNKNOWN_GROUP_VALUES:
+                return True
+            return any(token in normalized_key for token in ("status", "relation", "evidence")) and normalized in {
+                "none",
+                "null",
+            }
+        if isinstance(value, Mapping):
+            return any(contains_unknown(item, str(item_key)) for item_key, item in value.items())
+        if isinstance(value, (list, tuple, set)):
+            return any(contains_unknown(item, normalized_key) for item in value)
+        return False
+
+    if contains_unknown(observed):
+        return True
+    if any(key in observed for key in ("unchecked_fields", "missing_formatting_evidence")):
+        return True
+    # Inspector/linter messages are stable rule-facing text.  This fallback
+    # catches older producer envelopes that omitted comparison_status while
+    # still explicitly stating that the evidence is unavailable.
+    message = str(finding.get("message", ""))
+    return any(token in message for token in ("未知", "无法", "缺少", "混合"))
+
+
+def _finding_affected_count(finding: Mapping[str, Any]) -> int:
+    """Return raw target impact represented by one emitted finding."""
+
+    observed = finding.get("observed")
+    observed = observed if isinstance(observed, Mapping) else {}
+    if observed.get("aggregation") == "table_unknown":
+        value = observed.get("count", 1)
+    else:
+        value = observed.get("affected_target_count", 1)
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return 1
+
+
+_UNKNOWN_EVIDENCE_KEY_TOKENS = (
+    "reason",
+    "status",
+    "relation",
+    "unchecked",
+    "missing",
+    "unresolved",
+    "evidence",
+)
+
+
+def table_unknown_evidence_signature(
+    finding: Mapping[str, Any],
+) -> tuple[tuple[str, str], ...]:
+    """Return a stable semantic signature for one table uncertainty."""
+
+    observed = finding.get("observed")
+    observed = observed if isinstance(observed, Mapping) else {}
+    entries: list[tuple[str, str]] = []
+
+    def visit(value: Any, path: tuple[str, ...], selected: bool = False) -> None:
+        if isinstance(value, Mapping):
+            for key, child in sorted(value.items(), key=lambda item: str(item[0])):
+                normalized = str(key).casefold().replace("-", "_")
+                visit(
+                    child,
+                    (*path, str(key)),
+                    selected or any(token in normalized for token in _UNKNOWN_EVIDENCE_KEY_TOKENS),
+                )
+            return
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            for index, child in enumerate(value):
+                visit(child, (*path, str(index)), selected)
+            return
+        if isinstance(value, set):
+            for index, child in enumerate(sorted(value, key=repr)):
+                visit(child, (*path, str(index)), selected)
+            return
+        if selected:
+            entries.append((".".join(path), repr(value)))
+
+    visit(observed, ())
+    if not entries:
+        return (("message_fallback", str(finding.get("message", ""))),)
+    return tuple(entries)
+
+
+def _table_unknown_aggregates(materialized: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[
+        tuple[str, str, str, tuple[tuple[str, str], ...]],
+        list[dict[str, Any]],
+    ] = defaultdict(list)
+    for item in materialized:
+        if not _is_table_unknown_finding(item):
+            continue
+        target = item.get("target")
+        if not isinstance(target, Mapping):
+            continue
+        key = (
+            str(item.get("rule_id", "")),
+            str(item.get("status", "NOT_CHECKED")),
+            str(target.get("table_id", "")),
+            table_unknown_evidence_signature(item),
+        )
+        grouped[key].append(item)
+
+    result: list[dict[str, Any]] = []
+    for (rule_id, status, table_id, _evidence_signature), group in sorted(
+        grouped.items(), key=lambda pair: pair[0]
+    ):
+        examples: list[dict[str, Any]] = []
+        seen_targets: set[tuple[Any, ...]] = set()
+        for item in sorted(
+            group,
+            key=target_sort_key,
+        ):
+            observed = item.get("observed")
+            observed = observed if isinstance(observed, Mapping) else {}
+            supplied_examples = observed.get("examples")
+            candidates = (
+                supplied_examples
+                if isinstance(supplied_examples, Sequence)
+                and not isinstance(supplied_examples, (str, bytes))
+                else [item.get("target")]
+            )
+            for candidate in candidates:
+                if not isinstance(candidate, Mapping):
+                    continue
+                identity = (candidate.get("kind"), candidate.get("id"), candidate.get("index"))
+                if identity in seen_targets:
+                    continue
+                seen_targets.add(identity)
+                examples.append(_bound_content_snippets(dict(candidate)))
+                if len(examples) == 3:
+                    break
+            if len(examples) == 3:
+                break
+        counts = [_finding_affected_count(item) for item in group]
+        result.append(
+            {
+                "rule_id": rule_id,
+                "status": status,
+                "table_id": table_id,
+                "count": sum(counts),
+                "finding_count": len(group),
+                "affected_count": sum(counts),
+                "message": _message_for_group(group),
+                "grouping": "table_unknown",
+                "examples": examples,
+            }
+        )
+    return result
+
+
+# Kept public for the linter's output-stage compactor.  Both the summary and
+# detailed finding paths must use exactly the same conservative unknown-table
+# predicate, otherwise their counts diverge.
+is_table_unknown_finding = _is_table_unknown_finding
+
+
 def build_summary(findings: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     """Build status counts and compact, deterministic per-rule aggregates."""
 
@@ -171,9 +402,42 @@ def build_summary(findings: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     by_status_counter: Counter[str] = Counter(
         str(item.get("status", "NOT_CHECKED")) for item in materialized
     )
+    by_status_affected_counter: Counter[str] = Counter()
+    for item in materialized:
+        by_status_affected_counter[str(item.get("status", "NOT_CHECKED"))] += _finding_affected_count(
+            item
+        )
     # Preserve the complete status vocabulary in the output.  A consumer can
     # therefore distinguish a zero count from an old producer omitting a key.
     by_status = {status: int(by_status_counter.get(status, 0)) for status in STATUSES}
+    by_status_affected = {
+        status: int(by_status_affected_counter.get(status, 0))
+        for status in STATUSES
+    }
+
+    by_rule_status_counter: dict[str, Counter[str]] = defaultdict(Counter)
+    by_rule_status_affected_counter: dict[str, Counter[str]] = defaultdict(Counter)
+    for item in materialized:
+        rule_id = str(item.get("rule_id", ""))
+        status = str(item.get("status", "NOT_CHECKED"))
+        by_rule_status_counter[rule_id][status] += 1
+        by_rule_status_affected_counter[rule_id][status] += _finding_affected_count(item)
+    by_rule_and_status = {
+        rule_id: {
+            status: int(counter[status])
+            for status in STATUSES
+            if counter.get(status, 0)
+        }
+        for rule_id, counter in sorted(by_rule_status_counter.items())
+    }
+    by_rule_and_status_affected = {
+        rule_id: {
+            status: int(counter[status])
+            for status in STATUSES
+            if counter.get(status, 0)
+        }
+        for rule_id, counter in sorted(by_rule_status_affected_counter.items())
+    }
 
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for item in materialized:
@@ -185,10 +449,7 @@ def build_summary(findings: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
         seen_targets: set[tuple[Any, ...]] = set()
         for item in sorted(
             group,
-            key=lambda value: (
-                value.get("target", {}).get("index", 10**12),
-                value.get("target", {}).get("id", ""),
-            ),
+            key=target_sort_key,
         ):
             target = item.get("target")
             if not isinstance(target, Mapping):
@@ -209,13 +470,23 @@ def build_summary(findings: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
                 "rule_id": rule_id,
                 "status": status,
                 "count": len(group),
+                "finding_count": len(group),
+                "affected_count": sum(_finding_affected_count(item) for item in group),
                 "message": _message_for_group(group),
                 "examples": examples,
             }
         )
 
+    affected_target_count = sum(_finding_affected_count(item) for item in materialized)
     return {
         "total_findings": len(materialized),
+        "finding_count": len(materialized),
+        "affected_target_count": affected_target_count,
+        "total_affected_targets": affected_target_count,
         "by_status": by_status,
+        "by_status_affected": by_status_affected,
+        "by_rule_and_status": by_rule_and_status,
+        "by_rule_and_status_affected": by_rule_and_status_affected,
         "aggregates": aggregates,
+        "table_aggregates": _table_unknown_aggregates(materialized),
     }

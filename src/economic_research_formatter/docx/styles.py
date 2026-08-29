@@ -421,6 +421,13 @@ class StyleResolver:
                         take(key, values.get(key), layer)
         take_font(self.doc_defaults.get("font"), "docDefaults")
         resolution_chain.append("docDefaults")
+        # ``w:lang`` in ``docDefaults/w:rPrDefault`` participates in the same
+        # script-hint cascade as direct, character-style, paragraph-style and
+        # default-style language evidence.  It has to be consulted before the
+        # final unresolved-theme pass: a high-priority theme token occupies its
+        # slot, but can become resolvable once this document-wide hint is known.
+        if script_hint is None:
+            script_hint = self._script_from_language(self.doc_defaults.get("lang"))
         for key in _FORMAT_KEYS:
             if key != "font":
                 take(key, self.doc_defaults.get(key), "docDefaults")

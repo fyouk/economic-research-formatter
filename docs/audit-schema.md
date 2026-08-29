@@ -65,8 +65,14 @@ audit.md
   },
   "summary": {
     "total_findings": 0,
+    "finding_count": 0,
+    "affected_target_count": 0,
     "by_status": {},
-    "aggregates": []
+    "by_status_affected": {},
+    "by_rule_and_status": {},
+    "by_rule_and_status_affected": {},
+    "aggregates": [],
+    "table_aggregates": []
   },
   "capabilities": {
     "implemented": [],
@@ -80,6 +86,8 @@ audit.md
 ```
 
 `input` 不包含绝对路径。`classification.items` 保留角色、置信度、证据和来源 ID。
+
+`finding_count`（并保持兼容的 `total_findings`）统计输出中的 finding 数量；`affected_target_count` 统计这些 finding 所代表的原始受影响目标数量。`by_status` 与 `by_rule_and_status` 统计 finding 数，`by_status_affected` 与 `by_rule_and_status_affected` 统计受影响目标数，两组口径不可混用。
 
 ## Finding
 
@@ -124,4 +132,4 @@ audit.md
 
 ## 聚合
 
-`summary.aggregates` 按 `rule_id + status` 聚合重复结果，记录数量和最多三个示例目标。`audit.json` 仍保留所有逐目标明细；`audit.md` 只呈现紧凑聚合，避免重复问题淹没报告。
+`summary.aggregates` 按 `rule_id + status` 汇总结果，记录数量和最多三个示例目标。普通 finding 在 `audit.json` 中保留逐目标明细；同一表格内由同一规则、状态和未知证据触发的重复单元格 finding 会折叠成一个 table-level finding，并在 `observed.count` 与最多三个 `observed.examples` 中保留影响规模和定位样例。`summary.table_aggregates` 与 `audit.md` 使用同一聚合语义，避免重复问题淹没报告。

@@ -456,7 +456,7 @@ def test_markdown_falls_back_to_summary_aggregates_and_escapes_user_values(tmp_p
 
     markdown = render_markdown(audit)
 
-    assert "共记录 4 条规则结果。" in markdown
+    assert "共记录 4 条规则结果，涉及 4 个受影响目标。" in markdown
     assert "ER-REPORT-001" in markdown
     assert "p-0, p-1, p-2" in markdown
     assert "audit\\\\draft\\|v1 .md" in markdown
@@ -499,4 +499,4 @@ def test_markdown_skips_invalid_aggregates_and_supports_explicit_examples_and_em
 
     audit["summary"]["aggregates"] = "invalid"
     fallback_markdown = render_markdown(audit)
-    assert "| - | - | 0 | 没有规则结果 | - |" in fallback_markdown
+    assert "| - | - | 0 | 0 | 没有规则结果 | - |" in fallback_markdown

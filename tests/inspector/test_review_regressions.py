@@ -7,6 +7,7 @@ while still exercising the ZIP and XML boundaries that the Inspector owns.
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 import warnings
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -176,6 +177,49 @@ def test_default_field_and_hyperlink_evidence_is_bounded_and_path_safe(tmp_path:
     assert expanded["paragraphs"][0]["fields"][0]["instruction"].startswith("HYPERLINK")
 
 
+@pytest.mark.parametrize(
+    "target",
+    [
+        "file:///Users/alice/Private/client/chart.png",
+        "https://example.invalid/chart.png?token=secret-value",
+        "https://[invalid-ipv6/chart.png",
+        "https://example.invalid:not-a-port/chart.png",
+    ],
+)
+def test_external_image_target_is_hashed_and_redacted_by_default(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    body = (
+        '<w:p><w:r><w:drawing>'
+        '<wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+        '<wp:extent cx="12700" cy="12700"/><a:blip r:link="rId1"/>'
+        "</wp:inline></w:drawing></w:r></w:p>"
+    )
+    relations = (
+        (
+            "rId1",
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image",
+            target,
+            "External",
+        ),
+    )
+
+    report = inspect_docx(_write_docx(tmp_path, body=body, relations=relations))
+    image = report["images"][0]
+
+    assert target not in repr(report)
+    assert image["media_part"] is None
+    assert image["external_target_sha256"] == hashlib.sha256(target.encode()).hexdigest()
+    assert len(image["external_target_preview"]) <= 80
+    assert image["external_target_preview"] == (
+        "[local-path]" if target.startswith("file:") else "[external-image]"
+    )
+    assert "secret-value" not in image["external_target_preview"]
+    assert "/Users/alice" not in image["external_target_preview"]
+
+
 def test_effective_paragraph_properties_include_style_basedon_defaults_and_sources(tmp_path: Path) -> None:
     styles = (
         f'<w:styles xmlns:w="{W}">'
@@ -322,6 +366,8 @@ def test_numbering_resolves_abstract_number_zero_and_handles_override_and_missin
         "format": "lowerLetter",
         "text": "%1)",
         "resolved": True,
+        "numbered": True,
+        "removes_numbering": False,
     }
     assert report["paragraphs"][1]["numPr"]["abstract_num_id"] == 0
     assert report["paragraphs"][1]["numPr"]["resolved"] is False

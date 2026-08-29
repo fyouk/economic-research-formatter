@@ -7,7 +7,15 @@ from pathlib import Path
 from typing import Any
 
 from economic_research_formatter.classify.classifier import classify_inspection
-from economic_research_formatter.models.audit import AUDIT_SCHEMA_VERSION, build_summary, make_finding, target_for_document
+from economic_research_formatter.models.audit import (
+    AUDIT_SCHEMA_VERSION,
+    build_summary,
+    is_table_unknown_finding,
+    make_finding,
+    table_unknown_evidence_signature,
+    target_for_document,
+    target_sort_key,
+)
 from economic_research_formatter.rule_loader import ensure_rules_valid
 
 from .citations import lint_citation_rule
@@ -163,6 +171,95 @@ def _capabilities(rules: list[Mapping[str, Any]], findings: list[Mapping[str, An
     }
 
 
+def _aggregate_table_unknown_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Fold repeated unknown cell findings into one actionable table finding."""
+
+    grouped: dict[
+        tuple[str, str, str, tuple[tuple[str, str], ...]],
+        list[dict[str, Any]],
+    ] = {}
+    retained: list[dict[str, Any]] = []
+    for item in findings:
+        if not is_table_unknown_finding(item):
+            retained.append(item)
+            continue
+        target = item.get("target")
+        if not isinstance(target, Mapping):
+            retained.append(item)
+            continue
+        key = (
+            str(item.get("rule_id", "")),
+            str(item.get("status", "NOT_CHECKED")),
+            str(target.get("table_id", "")),
+            table_unknown_evidence_signature(item),
+        )
+        grouped.setdefault(key, []).append(item)
+
+    for (rule_id, status, table_id, _evidence_signature), group in sorted(
+        grouped.items(), key=lambda pair: pair[0]
+    ):
+        if len(group) == 1:
+            retained.extend(group)
+            continue
+        ordered = sorted(
+            group,
+            key=target_sort_key,
+        )
+        representative = ordered[0]
+        examples: list[dict[str, Any]] = []
+        seen: set[tuple[Any, ...]] = set()
+        for item in ordered:
+            target = item.get("target")
+            if not isinstance(target, Mapping):
+                continue
+            identity = (target.get("kind"), target.get("id"), target.get("index"))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            examples.append(dict(target))
+            if len(examples) == 3:
+                break
+        representative_observed = representative.get("observed")
+        representative_observed = (
+            dict(representative_observed) if isinstance(representative_observed, Mapping) else {}
+        )
+        representative_observed.update(
+            {
+                "aggregation": "table_unknown",
+                "count": len(group),
+                "examples": examples,
+            }
+        )
+        table_index = None
+        representative_target = representative.get("target")
+        if isinstance(representative_target, Mapping):
+            table_index = representative_target.get("table_index")
+        target: dict[str, Any] = {"kind": "table", "id": table_id, "table_id": table_id}
+        if table_index is not None:
+            target["index"] = table_index
+            target["table_index"] = table_index
+        confidences: list[float] = []
+        for item in group:
+            try:
+                confidences.append(float(item.get("confidence", 1.0)))
+            except (TypeError, ValueError):
+                continue
+        confidence = min(confidences) if confidences else 1.0
+        retained.append(
+            make_finding(
+                rule_id,
+                status,
+                str(representative.get("message", "")),
+                target=target,
+                observed=representative_observed,
+                expected=representative.get("expected") if isinstance(representative.get("expected"), Mapping) else {},
+                source=representative.get("source") if isinstance(representative.get("source"), Mapping) else {},
+                confidence=confidence,
+            )
+        )
+    return retained
+
+
 def lint_inspection(inspection: Mapping[str, Any] | None, root: Path | str | None = None) -> dict[str, Any]:
     """Run all supported rules over an Inspector dictionary.
 
@@ -226,6 +323,8 @@ def lint_inspection(inspection: Mapping[str, Any] | None, root: Path | str | Non
     for item in unresolved:
         findings.append(_unresolved_finding(item, context))
 
+    findings = _aggregate_table_unknown_findings(findings)
+
     # Every output list is stable even if a custom rule loader returns an
     # unordered mapping.  Findings are first grouped by source rule order, then
     # by target position, and finally by status/message.
@@ -233,8 +332,7 @@ def lint_inspection(inspection: Mapping[str, Any] | None, root: Path | str | Non
     findings.sort(
         key=lambda item: (
             rule_order.get(str(item.get("rule_id", "")), len(rule_order) + 1),
-            item.get("target", {}).get("index", 10**12) if isinstance(item.get("target"), Mapping) else 10**12,
-            str(item.get("target", {}).get("id", "")) if isinstance(item.get("target"), Mapping) else "",
+            *target_sort_key(item),
             str(item.get("status", "")),
             str(item.get("message", "")),
         )

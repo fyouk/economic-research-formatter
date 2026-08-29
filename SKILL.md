@@ -84,7 +84,7 @@ audit.json
 audit.md
 ```
 
-JSON 保留逐目标 finding，Markdown 按 rule ID 和状态聚合重复问题。
+JSON 对普通 finding 保留逐目标明细；同一表格内同规则、同状态、同未知证据的重复单元格结果折叠为一个 table-level finding，并保留数量和最多三个示例。Markdown 按 rule ID、状态和表格聚合展示。
 
 ## 未开放流程
 

@@ -13,12 +13,14 @@ Citation model   parenthetical / narrative / unknown + span + confidence
   ↓
 Rule Engine      加载 rules/*.yaml
   ↓
-Linter           7 类状态 + 逐目标 finding + capability summary
+Linter           7 类状态 + 逐目标 finding（同表同类 unknown 折叠）+ capability summary
   ↓
 Report           inspection.json + audit.json + audit.md
 ```
 
 当前管线截止于 Report，不包含 Safe Fixer、Re-Linter 或 Renderer QA。
+
+为计算只读 inspection 中的正文 dominant-size 证据，Inspector 会对已生成的 body paragraph 结构运行一次确定性的轻量角色分类，并据此排除摘要、标题、图题、参考文献等非正文目标。完整 Classifier 阶段随后仍对最终 inspection 统一生成公开的角色与 confidence；该内部 enrichment 不修改 DOCX，也不执行规则裁决。
 
 ## Source → rule → implementation
 
@@ -62,7 +64,7 @@ cli.py
 │   └── equations.py        # OMML 与 OLE 证据
 ├── classify/                    # 确定性 heuristic + evidence
 ├── lint/                        # manuscript/citation/reference handlers
-├── models/                      # inspection/audit/rule validation models
+├── models/                      # inspection/audit/rule validation + shared note/numbering/font-size semantics
 ├── profiles/                    # bundled journal profile data
 └── report/                      # 确定性 JSON 和中文 Markdown
 ```
