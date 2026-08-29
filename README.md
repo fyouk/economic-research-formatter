@@ -185,7 +185,7 @@ reports/audit/audit.md
 
 `lint` 会在内存中读取全文以识别文内引用，但默认写出的 `inspection.json` 仍仅包含截断预览。如果审计发现 `ERROR`，命令返回 1；执行失败返回 2。探索性审计可使用 `--exit-zero`。
 
-Latin-font v1 覆盖 body paragraph、table cell paragraph 和 footnote paragraph。Header/footer 内部文本、text box/drawing text 与 embedded chart 尚未进入该规则的字符级检查。
+Latin-font v1 覆盖 body paragraph、table cell paragraph、footnote paragraph 和 endnote paragraph。Header/footer 内部文本、text box/drawing text 与 embedded chart 尚未进入该规则的字符级检查。
 
 ## 结果状态
 

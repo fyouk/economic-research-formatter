@@ -120,6 +120,12 @@ audit.md
 
 引文 finding 的 `observed.candidate` 可包含 `kind` (`parenthetical` / `narrative` / `unknown`)、paragraph ID、span、authors、year、page、最多 80 字的 preview 与 confidence。合法 narrative citation 的作者在正文，括号内只保留年份/必要页码。
 
+参考文献版式 finding 的编号证据同时保留 `automatic_numbering_state` 与段首高置信 `visible_numbering`。可见序号还包含 `visible_marker`、基于原始文本的半开区间 `visible_marker_span` 和 `evidence_source=reference_text_prefix`。自动编号未知但可见序号明确时仍可确定违反“不标序号”；两者都存在时只生成一个可解释 finding。
+
+标题层级按证据确定性输出逐目标结果。同一 `ER-MS-HEADING-HIERARCHY-001` 可同时包含 definite target 的 `PASS` / `ERROR` 与 visible-only jump target 的 `MANUAL_REVIEW`；局部未知不会覆盖其他 target 的确定性违规。
+
+多字段表格规则以一个 target finding 组合各字段结果：任何 definite mismatch 都优先保留规则的 `ERROR` / `WARNING`，未知字段继续记录在 `unresolved_fields` / `unchecked_fields`；只有不存在确定性 mismatch 时，未知证据才产生 `MANUAL_REVIEW`。
+
 ## 状态
 
 - `PASS`：目标存在且已确定满足规则。

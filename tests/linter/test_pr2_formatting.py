@@ -39,6 +39,54 @@ def _chain(path: Path) -> tuple[dict, dict, dict]:
     return inspection, classification, audit
 
 
+def _table_inspection(*, font: str, relation: str) -> dict:
+    paragraph: dict = {
+        "id": "table-000000-cell-000000-p-0000",
+        "text": "表格正文",
+        "font_size_relation_to_body": relation,
+    }
+    if font == "unresolved_theme":
+        paragraph["runs"] = [
+            {
+                "text": "表格正文",
+                "formatting": {
+                    "effective": {
+                        "eastAsia": None,
+                        "font": {
+                            "theme": {"eastAsia": "majorEastAsia"},
+                            "theme_evidence": {"eastAsia": {"resolved": False}},
+                        },
+                    },
+                    "source": {"font": {"eastAsia": "unknown"}},
+                },
+            }
+        ]
+    else:
+        paragraph["effective_formatting"] = {"eastAsia": font}
+    return {
+        "schema_version": "1.0",
+        "input": {"filename": "pr3-table-matrix.docx"},
+        "paragraphs": [],
+        "tables": [
+            {
+                "id": "table-000000",
+                "cells": [
+                    {
+                        "id": "table-000000-cell-000000",
+                        "row": 0,
+                        "column": 0,
+                        "paragraphs": [paragraph],
+                    }
+                ],
+            }
+        ],
+        "images": [],
+        "equations": {"omath_count": 0, "paragraph_ids": []},
+        "notes": {"footnotes": {"actual_count": 0, "items": []}},
+        "fields": {},
+    }
+
+
 def test_unresolved_theme_font_is_manual_review_not_error_from_real_docx(tmp_path: Path) -> None:
     inspection, classification, audit = _chain(
         make_unresolved_theme_title_docx(tmp_path)
@@ -228,6 +276,33 @@ def test_resolved_concrete_table_note_font_mismatch_remains_warning(tmp_path: Pa
     assert classification["summary"]["paragraph_count"] == len(inspection["paragraphs"])
     assert finding["status"] == "WARNING"
     assert finding["observed"]["east_asia_font"] == "黑体"
+
+
+@pytest.mark.parametrize(
+    ("font", "relation", "expected_status"),
+    [
+        ("黑体", "unknown", "WARNING"),
+        ("仿宋", "unknown", "MANUAL_REVIEW"),
+        ("unresolved_theme", "larger", "WARNING"),
+        ("仿宋", "smaller", "PASS"),
+        ("黑体", "larger", "WARNING"),
+    ],
+)
+def test_table_multifield_outcome_keeps_definite_mismatch_over_unknown(
+    font: str,
+    relation: str,
+    expected_status: str,
+) -> None:
+    audit = lint_inspection(_table_inspection(font=font, relation=relation))
+    finding = _finding(audit, "ER-MS-TABLE-001")
+
+    assert finding["status"] == expected_status
+    if relation == "unknown":
+        assert "font_size_relation_to_body" in finding["observed"]["unresolved_fields"]
+    if font == "unresolved_theme":
+        assert finding["observed"]["unresolved_formatting_fields"] == [
+            "east_asia_font"
+        ]
 
 
 def test_linter_uses_canonical_chinese_font_size_mapping() -> None:

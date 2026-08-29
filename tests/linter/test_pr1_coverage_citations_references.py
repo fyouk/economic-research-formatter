@@ -103,6 +103,14 @@ def test_citation_candidates_capture_pages_year_suffixes_and_truncated_previews(
     assert truncated[0].confidence == 0.70
     assert truncated[0].end == len("结论见（Smith, 2020")
 
+    explicit_four_digit_page = _citation_candidates(
+        {"id": "p-four-digit-page", "text": "(Smith, 2011, p. 2020)"}
+    )
+    assert len(explicit_four_digit_page) == 1
+    assert explicit_four_digit_page[0].kind == "parenthetical"
+    assert explicit_four_digit_page[0].year == "2011"
+    assert explicit_four_digit_page[0].page == "2020"
+
 
 def test_citation_candidate_parser_rejects_non_author_shapes_and_keeps_real_empty_segments() -> None:
     assert _citation_candidates({"id": "p-empty", "text": "（张三,,李四, 2020）"})[0].authors == ("张三", "李四")
@@ -133,7 +141,7 @@ def test_nested_parenthetical_is_not_double_counted_and_multisource_no_separator
     nested = _citation_candidates({"id": "p-nested", "text": "Smith (Jones, 2020)"})
 
     assert [(candidate.kind, candidate.authors, candidate.year) for candidate in nested] == [
-        ("narrative", ("Smith",), "2020"),
+        ("parenthetical", ("Jones",), "2020"),
     ]
 
     audit = lint_inspection(_inspection({"text": "（Smith 2020, Jones 2021）"}))
@@ -186,13 +194,13 @@ def test_multi_author_rules_cover_explicit_and_et_al_forms_and_skip_wrong_author
     assert _one_finding(wrong_count, "ER-CIT-ZH-TWOAUTHORS-001")["status"] == "NOT_APPLICABLE"
 
 
-def test_narrative_rule_rejects_author_inside_parentheses() -> None:
+def test_parenthetical_author_inside_parentheses_is_not_a_narrative_error() -> None:
     audit = lint_inspection(_inspection({"text": "张三（Smith, 2020）提出……"}, {"text": "张三（2021）指出……"}))
 
     findings = _rule_findings(audit, "ER-CIT-NARRATIVE-001")
-    assert {item["status"] for item in findings} == {"PASS", "ERROR"}
-    error = next(item for item in findings if item["status"] == "ERROR")
-    assert error["observed"]["authors_in_parentheses"] == ["Smith"]
+    assert {item["status"] for item in findings} == {"PASS"}
+    assert len(findings) == 1
+    assert findings[0]["target"]["id"] == "p-000001"
 
 
 def test_footnote_rules_distinguish_content_ambiguous_ordinary_and_missing_evidence() -> None:

@@ -34,7 +34,7 @@ Citation v1 只对高置信度表层模式执行检查，并排除 TOC、公式�
 - Comments、tracked changes 和 embedded objects 当前主要记录主文档 OOXML 证据。
 - Header/footer 关系按 section 报告，其内部段落不混入 body inventory。
 
-Latin-font v1 检查 body paragraph、table cell paragraph 和 footnote paragraph。Header/footer 内部文本、text box/drawing text 和 embedded chart 尚未进入字符级字体审计。
+Latin-font v1 检查 body paragraph、table cell paragraph、footnote paragraph 和 endnote paragraph。Header/footer 内部文本、text box/drawing text 和 embedded chart 尚未进入字符级字体审计。
 
 ## 规则范围
 

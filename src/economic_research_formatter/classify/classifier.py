@@ -8,7 +8,10 @@ import re
 from typing import Any
 
 from economic_research_formatter.models.notes import iter_note_targets
-from economic_research_formatter.models.numbering import numbering_state as _numbering_state
+from economic_research_formatter.models.numbering import (
+    numbering_state as _numbering_state,
+    visible_reference_numbering_evidence,
+)
 
 from .patterns import (
     ABSTRACT_RE,
@@ -457,13 +460,18 @@ def _classify_paragraphs(inspection: Mapping[str, Any]) -> list[dict[str, Any]]:
             # paragraphs from becoming phantom entries.
             numbering = _numbering(paragraph)
             numbering_state = _numbering_state(numbering)
-            if numbering_state is True or paragraph.get("in_reference") or paragraph.get("reference_entry") or is_probable_reference_text(text):
+            visible_numbering = visible_reference_numbering_evidence(text)[
+                "visible_numbering"
+            ]
+            if numbering_state is True or visible_numbering or paragraph.get("in_reference") or paragraph.get("reference_entry") or is_probable_reference_text(text):
                 role, confidence = "reference_entry", 0.98
                 evidence.append("after_reference_heading")
                 if numbering_state is True:
                     evidence.append("automatic_numbering")
                 elif numbering_state is None:
                     evidence.append("unresolved_numbering")
+                if visible_numbering:
+                    evidence.append("visible_numbering")
                 if paragraph.get("in_reference") or paragraph.get("reference_entry"):
                     evidence.append("inspector_reference_marker")
             else:

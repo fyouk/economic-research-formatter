@@ -36,9 +36,21 @@ def test_real_heading_structure_prevents_swapped_l3_l4_prefix_pass(tmp_path: Pat
         "heading_level_4",
     ]
 
-    finding = _finding(audit, "ER-MS-HEADING-HIERARCHY-001")
-    assert finding["status"] == "ERROR"
-    assert {item["level"] for item in finding["observed"]["violations"]} == {3, 4}
+    hierarchy_findings = [
+        item
+        for item in audit["findings"]
+        if item["rule_id"] == "ER-MS-HEADING-HIERARCHY-001"
+    ]
+    error_findings = [
+        item for item in hierarchy_findings if item["status"] == "ERROR"
+    ]
+    assert {item["status"] for item in hierarchy_findings} == {"PASS", "ERROR"}
+    assert len(error_findings) == 2
+    assert {
+        violation["level"]
+        for finding in error_findings
+        for violation in finding["observed"]["violations"]
+    } == {3, 4}
     assert all(
         any(token.startswith(("style=", "outline_level=", "numbering_ilvl=")) for token in item["evidence"])
         for item in classification["items"]

@@ -226,6 +226,9 @@ def _note_reference_evidence(
                 }
             )
     references.sort(key=lambda item: (item["run_index"] if item["run_index"] is not None else 10**9, item["kind"]))
+    for occurrence_index, item in enumerate(references):
+        item["occurrence_index"] = occurrence_index
+        item["reference_index"] = occurrence_index
     footnote_ids = [item["id"] for item in references if item["kind"] == "footnote" and item["id"] is not None]
     endnote_ids = [item["id"] for item in references if item["kind"] == "endnote" and item["id"] is not None]
     return {

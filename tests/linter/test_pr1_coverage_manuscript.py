@@ -72,6 +72,140 @@ def test_valid_heading_hierarchy_accepts_two_ascii_spaces_and_source_sequence() 
     ]
 
 
+def test_definite_heading_error_is_not_hidden_by_ambiguous_jump() -> None:
+    inspection = _inspection(
+        {
+            "text": "1.1 研究背景",
+            "style_name": "Heading 2",
+            "outline_level": 1,
+        },
+        {
+            "text": "1. 变量定义",
+            "style_name": "Heading 4",
+            "outline_level": 3,
+        },
+        {"text": "  （二）正文枚举项"},
+    )
+
+    findings = _findings(
+        lint_inspection(inspection),
+        "ER-MS-HEADING-HIERARCHY-001",
+    )
+
+    assert {item["status"] for item in findings} == {"ERROR", "MANUAL_REVIEW"}
+    errors = [item for item in findings if item["status"] == "ERROR"]
+    manual = next(item for item in findings if item["status"] == "MANUAL_REVIEW")
+    assert {(item["target"]["id"], item["status"]) for item in errors} == {
+        ("p-000000", "ERROR"),
+        ("p-000001", "ERROR"),
+    }
+    assert {
+        violation["level"]
+        for item in errors
+        for violation in item["observed"]["violations"]
+    } == {2, 4}
+    assert all(len(item["observed"]["violations"]) == 1 for item in errors)
+    assert manual["target"]["id"] == "p-000002"
+
+
+def test_compliant_definite_heading_and_ambiguous_target_keep_both_outcomes() -> None:
+    inspection = _inspection(
+        {
+            "text": "  （一）理论分析",
+            "style_name": "Heading 2",
+            "outline_level": 1,
+        },
+        {"text": "（1）正文枚举项"},
+    )
+
+    findings = _findings(
+        lint_inspection(inspection),
+        "ER-MS-HEADING-HIERARCHY-001",
+    )
+
+    assert {item["status"] for item in findings} == {"PASS", "MANUAL_REVIEW"}
+    assert {
+        (item["target"]["id"], item["status"])
+        for item in findings
+    } == {
+        ("p-000000", "PASS"),
+        ("p-000001", "MANUAL_REVIEW"),
+    }
+
+
+def test_only_visible_ambiguous_heading_jump_stays_manual() -> None:
+    inspection = _inspection(
+        {"text": "  （一）理论分析"},
+        {"text": "（1）正文枚举项"},
+    )
+
+    findings = _findings(
+        lint_inspection(inspection),
+        "ER-MS-HEADING-HIERARCHY-001",
+    )
+
+    assert {item["status"] for item in findings} == {"MANUAL_REVIEW"}
+    assert {item["target"]["id"] for item in findings} == {
+        "p-000000",
+        "p-000001",
+    }
+
+
+@pytest.mark.parametrize(
+    "paragraphs",
+    [
+        ({"text": "1.1 研究背景"},),
+        ({"text": "（1）正文枚举项"},),
+        ({"text": "1.1 研究背景"}, {"text": "1.2 文献回顾"}),
+    ],
+)
+def test_visible_only_heading_without_independent_level_evidence_is_manual(
+    paragraphs: tuple[dict, ...],
+) -> None:
+    findings = _findings(
+        lint_inspection(_inspection(*paragraphs)),
+        "ER-MS-HEADING-HIERARCHY-001",
+    )
+
+    assert {item["status"] for item in findings} == {"MANUAL_REVIEW"}
+    assert {item["target"]["id"] for item in findings} == {
+        f"p-{index:06d}" for index in range(len(paragraphs))
+    }
+    assert all(
+        item["observed"]["hierarchy_evidence"] == "visible_prefix_only"
+        for item in findings
+    )
+
+
+def test_toc_heading_and_body_enumeration_cannot_cancel_definite_body_error() -> None:
+    inspection = _inspection(
+        {
+            "text": "1.1 目录标题",
+            "style_name": "Heading 2",
+            "outline_level": 1,
+            "in_toc": True,
+        },
+        {
+            "text": "1.1 正文标题",
+            "style_name": "Heading 2",
+            "outline_level": 1,
+        },
+        {"text": "（1）正文枚举项"},
+    )
+
+    findings = _findings(
+        lint_inspection(inspection),
+        "ER-MS-HEADING-HIERARCHY-001",
+    )
+
+    assert "ERROR" in {item["status"] for item in findings}
+    assert all(item["target"].get("id") != "p-000000" for item in findings)
+    assert any(
+        item["status"] == "ERROR" and item["target"]["id"] == "p-000001"
+        for item in findings
+    )
+
+
 def test_title_without_author_information_is_not_applicable_for_marker_check() -> None:
     inspection = _inspection({"text": "题目：没有作者信息目标"})
 

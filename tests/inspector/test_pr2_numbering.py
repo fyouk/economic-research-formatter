@@ -98,6 +98,144 @@ def test_resolved_numbering_real_chain_drives_reference_layout(tmp_path: Path) -
     assert finding["observed"]["numbered"] is True
 
 
+@pytest.mark.parametrize(
+    "marker",
+    ["[1]", "［1］", "【1】", "1.", "1．", "1、", "(1)", "（1）"],
+)
+def test_visible_reference_numbering_is_error_from_real_docx(
+    tmp_path: Path,
+    marker: str,
+) -> None:
+    path = write_numbering_docx(
+        tmp_path,
+        body=(
+            paragraph(run("参考文献"))
+            + paragraph(
+                run(f"  {marker} Smith, J. (2020). A paper.", size_pt=7.5, font="宋体")
+            )
+        ),
+        filename=f"visible-reference-{ord(marker[0])}.docx",
+    )
+
+    inspection, classification, audit = _chain(path)
+    findings = [
+        item
+        for item in audit["findings"]
+        if item["rule_id"] == "ER-MS-REF-LAYOUT-001"
+    ]
+
+    assert classification["items"][1]["role"] == "reference_entry"
+    assert len(findings) == 1
+    assert findings[0]["status"] == "ERROR"
+    assert findings[0]["observed"]["automatic_numbering_state"] is False
+    assert findings[0]["observed"]["visible_numbering"] is True
+    assert findings[0]["observed"]["visible_marker"] == marker
+    assert findings[0]["observed"]["visible_marker_span"] == [2, 2 + len(marker)]
+    assert findings[0]["observed"]["evidence_source"] == "reference_text_prefix"
+    assert inspection["paragraphs"][1]["numbering"] is None
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    ["3M Company,", "[J] Smith,", "2020 Smith,"],
+)
+def test_reference_prefix_false_positive_guards_remain_unnumbered(
+    tmp_path: Path,
+    prefix: str,
+) -> None:
+    path = write_numbering_docx(
+        tmp_path,
+        body=(
+            paragraph(run("参考文献"))
+            + paragraph(
+                run(f"  {prefix} J. (2020). A paper.", size_pt=7.5, font="宋体")
+            )
+        ),
+        filename=f"visible-reference-guard-{prefix[0].encode().hex()}.docx",
+    )
+
+    _, _, audit = _chain(path)
+    finding = next(
+        item
+        for item in audit["findings"]
+        if item["rule_id"] == "ER-MS-REF-LAYOUT-001"
+    )
+
+    assert finding["status"] == "PASS"
+    assert finding["observed"]["automatic_numbering_state"] is False
+    assert finding["observed"]["visible_numbering"] is False
+
+
+def test_automatic_and_visible_reference_numbering_emit_one_explained_error(
+    tmp_path: Path,
+) -> None:
+    path = write_numbering_docx(
+        tmp_path,
+        body=(
+            paragraph(run("参考文献"))
+            + paragraph(
+                run("  [1] Smith, J. (2020). A paper.", size_pt=7.5, font="宋体"),
+                num_id=7,
+                ilvl=0,
+            )
+        ),
+        abstract_nums=(abstract_num(3, level(0)),),
+        nums=num(7, 3),
+        filename="automatic-and-visible-reference.docx",
+    )
+
+    _, _, audit = _chain(path)
+    findings = [
+        item
+        for item in audit["findings"]
+        if item["rule_id"] == "ER-MS-REF-LAYOUT-001"
+    ]
+
+    assert len(findings) == 1
+    assert findings[0]["status"] == "ERROR"
+    assert findings[0]["observed"]["automatic_numbering_state"] is True
+    assert findings[0]["observed"]["visible_numbering"] is True
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_status", "expected_visible"),
+    [
+        ("  [1] Smith, J. (2020). A paper.", "ERROR", True),
+        ("  Smith, J. (2020). A paper.", "MANUAL_REVIEW", False),
+    ],
+)
+def test_unresolved_automatic_numbering_defers_to_definite_visible_prefix(
+    tmp_path: Path,
+    text: str,
+    expected_status: str,
+    expected_visible: bool,
+) -> None:
+    path = write_numbering_docx(
+        tmp_path,
+        body=(
+            paragraph(run("参考文献"))
+            + paragraph(
+                run(text, size_pt=7.5, font="宋体"),
+                num_id=7,
+                ilvl=0,
+            )
+        ),
+        filename=f"unresolved-reference-{int(expected_visible)}.docx",
+    )
+
+    inspection, _, audit = _chain(path)
+    finding = next(
+        item
+        for item in audit["findings"]
+        if item["rule_id"] == "ER-MS-REF-LAYOUT-001"
+    )
+
+    assert inspection["paragraphs"][1]["numbering"]["numbered"] is None
+    assert finding["status"] == expected_status
+    assert finding["observed"]["automatic_numbering_state"] is None
+    assert finding["observed"]["visible_numbering"] is expected_visible
+
+
 def test_sparse_child_style_num_pr_merges_based_on_values(tmp_path: Path) -> None:
     styles = (
         paragraph_style("ChildStyle", based_on="BaseStyle", ilvl=1)
@@ -395,10 +533,12 @@ def test_one_structural_heading_cannot_validate_an_unresolved_jump_peer(
         styles=styles,
     )
 
-    finding = next(
+    findings = [
         item
         for item in lint_inspection(inspect_docx(path))["findings"]
         if item["rule_id"] == "ER-MS-HEADING-HIERARCHY-001"
-    )
+    ]
 
-    assert finding["status"] == "MANUAL_REVIEW"
+    assert {item["status"] for item in findings} == {"PASS", "MANUAL_REVIEW"}
+    manual = next(item for item in findings if item["status"] == "MANUAL_REVIEW")
+    assert manual["target"]["id"] == "p-000001"

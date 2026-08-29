@@ -55,11 +55,23 @@ def test_hierarchy_requires_l2_two_ascii_spaces_and_exact_l3_l4_prefixes() -> No
         {"text": "1. 变量定义", "role_hint": "heading_level_4"},
     )
 
-    finding = _finding(lint_inspection(inspection), "ER-MS-HEADING-HIERARCHY-001")
+    findings = _findings(
+        lint_inspection(inspection),
+        "ER-MS-HEADING-HIERARCHY-001",
+    )
 
-    assert finding["status"] == "ERROR"
-    assert {item["level"] for item in finding["observed"]["violations"]} == {2, 3, 4}
-    assert finding["observed"]["headings"][0]["text_preview"].startswith("（一）")
+    assert {item["status"] for item in findings} == {"ERROR"}
+    assert {item["target"]["id"] for item in findings} == {
+        "p-000000",
+        "p-000001",
+        "p-000002",
+    }
+    assert {
+        violation["level"]
+        for finding in findings
+        for violation in finding["observed"]["violations"]
+    } == {2, 3, 4}
+    assert findings[0]["observed"]["headings"][0]["text_preview"].startswith("（一）")
 
 
 def test_hierarchy_uses_conservative_u3000_policy() -> None:
@@ -103,12 +115,15 @@ def test_table_mixed_relative_size_is_manual_review() -> None:
     assert finding["observed"]["font_size_relation_to_body"] == "mixed"
 
 
-def test_real_mixed_table_without_valid_relation_stays_manual(tmp_path: Path) -> None:
+def test_real_mixed_table_keeps_definite_font_mismatch_with_unknown_relation(tmp_path: Path) -> None:
     report = inspect_docx(make_mixed_table_docx(tmp_path))
 
     finding = _finding(lint_inspection(report), "ER-MS-TABLE-001")
 
-    assert finding["status"] == "MANUAL_REVIEW"
+    assert finding["status"] == "WARNING"
+    assert finding["observed"]["unresolved_fields"] == [
+        "font_size_relation_to_body"
+    ]
     assert "font_size_relation_to_body" in finding["observed"].get("unchecked_fields", []) or finding["observed"].get("comparison_status") in {"mixed", "unknown"}
 
 

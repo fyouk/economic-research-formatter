@@ -111,7 +111,17 @@ def note_infos(inspection: Mapping[str, Any]) -> dict[NoteKind, Mapping[str, Any
 
 
 def note_linkage(info: Mapping[str, Any], kind: NoteKind) -> dict[str, Any]:
-    """Describe active note/reference identity intersection and mismatches."""
+    """Describe note/reference identity sets and linkage mismatches.
+
+    Definition-level checks use ``definition_checkable_ids``: a note must have
+    exactly one definition and at least one matching reference, but duplicate
+    reference locations do not make the definition's content ambiguous.
+    Reference-position checks use ``reference_position_checkable_ids`` only as
+    an eligibility set; callers must still evaluate every concrete occurrence.
+
+    ``active_note_ids`` and ``active_reference_ids`` remain compatibility
+    aliases for those two policy-specific sets.
+    """
 
     raw_note_ids = info.get("ids", [])
     note_ids = (
@@ -140,21 +150,43 @@ def note_linkage(info: Mapping[str, Any], kind: NoteKind) -> dict[str, Any]:
             result.append(value)
         return result
 
-    active_note_ids = unique_in_order(
+    uniquely_defined_ids = unique_in_order(
+        [value for value in note_ids if note_counts[str(value)] == 1]
+    )
+    uniquely_referenced_ids = unique_in_order(
+        [value for value in reference_ids if reference_counts[str(value)] == 1]
+    )
+    uniquely_bound_ids = unique_in_order(
+        [
+            value
+            for value in note_ids
+            if note_counts[str(value)] == 1
+            and reference_counts[str(value)] == 1
+        ]
+    )
+    definition_checkable_ids = unique_in_order(
         [
             value
             for value in note_ids
             if str(value) in reference_keys and note_counts[str(value)] == 1
         ]
     )
-    active_reference_ids = unique_in_order(
+    reference_position_checkable_ids = unique_in_order(
         [
             value
             for value in reference_ids
             if str(value) in note_keys and note_counts[str(value)] == 1
         ]
     )
-    unreferenced_note_ids = unique_in_order([value for value in note_ids if str(value) not in reference_keys])
+    active_note_ids = definition_checkable_ids
+    active_reference_ids = reference_position_checkable_ids
+    unreferenced_note_ids = (
+        unique_in_order(
+            [value for value in note_ids if str(value) not in reference_keys]
+        )
+        if has_reference_evidence
+        else []
+    )
     missing_definition_reference_ids = unique_in_order(
         [value for value in reference_ids if str(value) not in note_keys]
     )
@@ -180,6 +212,11 @@ def note_linkage(info: Mapping[str, Any], kind: NoteKind) -> dict[str, Any]:
         "has_reference_evidence": has_reference_evidence,
         "note_ids": note_ids,
         "reference_ids": reference_ids,
+        "uniquely_defined_ids": uniquely_defined_ids,
+        "uniquely_referenced_ids": uniquely_referenced_ids,
+        "uniquely_bound_ids": uniquely_bound_ids,
+        "definition_checkable_ids": definition_checkable_ids,
+        "reference_position_checkable_ids": reference_position_checkable_ids,
         "active_note_ids": active_note_ids,
         "active_reference_ids": active_reference_ids,
         "unreferenced_note_ids": unreferenced_note_ids,
@@ -200,7 +237,9 @@ def iter_note_targets(inspection: Mapping[str, Any]) -> Iterator[NoteTarget]:
             continue
         linkage = note_linkage(info, kind)
         has_reference_evidence = linkage["has_reference_evidence"]
-        referenced_ids = {str(value) for value in linkage["active_reference_ids"]}
+        referenced_ids = {
+            str(value) for value in linkage["definition_checkable_ids"]
+        }
         for index, raw in enumerate(_items(info)):
             note_id = _note_id(raw, kind, index)
             if (has_reference_evidence or linkage.get("has_issue")) and str(note_id) not in referenced_ids:

@@ -36,6 +36,8 @@ Inspector 和 Linter 均只读输入 DOCX。集成测试还会比较执行前后
 私有集成验收还会核对：
 
 - narrative citation 不被 GENERAL 规则误报，连接词规则仍独立生效；
+- 固定论文中已知普通 parenthetical 样例精确保持 `kind=parenthetical`，`ER-CIT-NARRATIVE-001` 的 `ERROR` 为 0；
+- `ER-MS-HEADING-HIERARCHY-001` 至少保留一个具有独立结构证据的确定性 `ERROR`，局部 ambiguous jump 可另有 `MANUAL_REVIEW`；
 - 多来源 ASCII 分号定位到实际候选段落；
 - 53 个参考文献条目和 53 个可解析自动编号；
 - 页码范围 finding 选中真实 pages span，不把括号内卷期范围当页码；

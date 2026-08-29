@@ -7,6 +7,7 @@ import pytest
 from economic_research_formatter.classify.classifier import classify_inspection
 from economic_research_formatter.docx.inspector import inspect_docx
 from economic_research_formatter.lint.engine import lint_inspection
+from economic_research_formatter.models.notes import note_linkage
 
 from .pr2_notes_docx import make_notes_docx
 
@@ -680,7 +681,7 @@ def test_reference_id_without_matching_definition_cannot_produce_restart_error(
     assert content[0]["observed"]["note_linkage_issues"]
 
 
-def test_duplicate_active_reference_is_not_linted_as_two_definite_restart_results(
+def test_duplicate_active_reference_keeps_each_reference_location_result(
     tmp_path: Path,
 ) -> None:
     path = make_notes_docx(
@@ -698,11 +699,100 @@ def test_duplicate_active_reference_is_not_linted_as_two_definite_restart_result
     assert info["ids"] == [1]
     assert info["references"] == [1, 1]
     assert info["one_to_one"] is False
-    assert len(restart) == 2
+    assert len(restart) == 3
     assert {item["status"] for item in restart} == {"PASS", "MANUAL_REVIEW"}
+    assert sum(item["status"] == "PASS" for item in restart) == 2
     manual = next(item for item in restart if item["status"] == "MANUAL_REVIEW")
     assert manual["target"]["kind"] == "document"
     assert manual["observed"]["note_linkage_issues"]
+
+
+def test_duplicate_footnote_reference_across_sections_keeps_pass_error_and_linkage_manual(
+    tmp_path: Path,
+) -> None:
+    path = make_notes_docx(
+        tmp_path,
+        notes=(("footnote", 1, "内容脚注"),),
+        references=((0, "footnote", 1), (1, "footnote", 1)),
+        settings={"footnote": {"numRestart": "eachPage"}},
+        section_overrides=(
+            None,
+            {"footnote": {"numRestart": "continuous"}},
+        ),
+        body_texts=("第一节", "第二节"),
+        filename="duplicate-footnote-reference-cross-section.docx",
+    )
+
+    inspection, _, audit = _chain(path)
+    linkage = note_linkage(inspection["notes"]["footnotes"], "footnote")
+    findings = _rule_findings(audit, "ER-MS-FOOTNOTE-001")
+    reference_findings = [
+        item for item in findings if item["target"]["kind"] == "footnote_reference"
+    ]
+    manual = next(item for item in findings if item["target"]["kind"] == "document")
+
+    assert linkage["uniquely_defined_ids"] == [1]
+    assert linkage["uniquely_referenced_ids"] == []
+    assert linkage["uniquely_bound_ids"] == []
+    assert linkage["duplicate_reference_ids"] == [1]
+    assert [(item["target"]["section_index"], item["status"]) for item in reference_findings] == [
+        (0, "PASS"),
+        (1, "ERROR"),
+    ]
+    assert manual["status"] == "MANUAL_REVIEW"
+    assert manual["observed"]["note_linkage_issues"]
+
+
+def test_duplicate_endnote_reference_keeps_both_section_evidence_and_linkage_manual(
+    tmp_path: Path,
+) -> None:
+    path = make_notes_docx(
+        tmp_path,
+        notes=(("endnote", 3, "This note explains the sample (Smith, 2020)."),),
+        references=((0, "endnote", 3), (1, "endnote", 3)),
+        settings={"endnote": {"numFmt": "upperRoman", "numRestart": "continuous"}},
+        section_overrides=(
+            None,
+            {"endnote": {"numFmt": "lowerRoman", "numRestart": "eachPage"}},
+        ),
+        body_texts=("第一节", "第二节"),
+        filename="duplicate-endnote-reference-cross-section.docx",
+    )
+
+    inspection, _, audit = _chain(path)
+    info = inspection["notes"]["endnotes"]
+    linkage = note_linkage(info, "endnote")
+    first = inspection["paragraphs"][0]["endnote_reference_evidence"][0]
+    second = inspection["paragraphs"][1]["endnote_reference_evidence"][0]
+
+    assert linkage["uniquely_defined_ids"] == [3]
+    assert linkage["uniquely_referenced_ids"] == []
+    assert linkage["uniquely_bound_ids"] == []
+    assert linkage["duplicate_reference_ids"] == [3]
+    assert first["section_index"] == 0
+    assert first["effective_properties"]["numFmt"] == "upperRoman"
+    assert first["effective_properties"]["numRestart"] == "continuous"
+    assert second["section_index"] == 1
+    assert second["effective_properties"]["numFmt"] == "lowerRoman"
+    assert second["effective_properties"]["numRestart"] == "eachPage"
+    general = _rule_findings(audit, "ER-CIT-GENERAL-001")
+    assert {(item["status"], item["target"]["kind"]) for item in general} == {
+        ("MANUAL_REVIEW", "document")
+    }
+    content = _rule_findings(audit, "ER-REF-CONTENT-FOOTNOTE-001")
+    assert {(item["status"], item["target"]["kind"]) for item in content} == {
+        ("PASS", "endnote"),
+        ("MANUAL_REVIEW", "document"),
+    }
+    assert all(
+        item["observed"].get("note_linkage_issues")
+        for item in [*general, *content]
+        if item["target"]["kind"] == "document"
+    )
+    assert {
+        item["status"]
+        for item in _rule_findings(audit, "ER-MS-FOOTNOTE-001")
+    } == {"NOT_APPLICABLE"}
 
 
 def test_duplicate_note_definition_is_not_linted_as_a_definite_violation(

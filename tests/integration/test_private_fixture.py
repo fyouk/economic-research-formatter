@@ -10,6 +10,7 @@ import pytest
 
 from economic_research_formatter.classify.classifier import classify_inspection
 from economic_research_formatter.docx.inspector import inspect_docx
+from economic_research_formatter.lint.citations import _citation_candidates
 from economic_research_formatter.lint.engine import lint_inspection
 
 
@@ -127,10 +128,7 @@ def test_private_fixture_required_audit_conclusions(private_audit):
     for rule_id in required_errors:
         assert "ERROR" in statuses_by_rule[rule_id]
 
-    # The fixed paper's visible hierarchy is still actionable, but the
-    # underlying numbering evidence is unresolved under the PR2 semantics.
-    # Unknown structure must not be promoted to a deterministic violation.
-    assert statuses_by_rule["ER-MS-HEADING-HIERARCHY-001"] == {"MANUAL_REVIEW"}
+    assert "ERROR" in statuses_by_rule["ER-MS-HEADING-HIERARCHY-001"]
 
     assert statuses_by_rule["ER-MS-EQUATION-001"] == {"PASS"}
     assert "MANUAL_REVIEW" in statuses_by_rule["ER-MS-FIGURE-002"]
@@ -202,6 +200,66 @@ def test_private_narrative_citations_do_not_trigger_general_errors(
         ]
         assert connector_findings
         assert all(finding["status"] == "ERROR" for finding in connector_findings)
+
+
+def test_private_parenthetical_examples_are_not_narrative_false_positives(
+    private_analysis_inspection, private_audit
+):
+    published_literals = (
+        "（Foxman, 2016）",
+        "（Akerlof，1978）",
+        "（Brown et al.，2025）",
+        "（秦荣生，2025）",
+        "（姜涛和尚鼎，2020）",
+    )
+    paragraphs = private_analysis_inspection["paragraphs"]
+
+    for literal in published_literals:
+        paragraph = next(
+            item for item in paragraphs if literal in item.get("text", "")
+        )
+        matching = [
+            candidate
+            for candidate in _citation_candidates(paragraph)
+            if candidate.raw_preview == literal
+        ]
+        assert matching
+        assert {candidate.kind for candidate in matching} == {"parenthetical"}
+
+    # Opaque digests cover all ten individually reviewed false-positive spans
+    # without committing the five additional private-paper literals or any
+    # private paragraph IDs to repository history.
+    reviewed_span_digests = {
+        "0cbba79a52787ea40aa933b8331a9aedf5fca1c65aa1f7923ac65d7178383d57",
+        "1b0c196b9998e2d19bd16f5c0e33c8c1b55ac592b3c1d4052ea805fef4732e0d",
+        "1fa9c8592b7e38ed1e6a409f4a630bffe9a8b46742fe131053c3a82287083260",
+        "3a0e563606f6b67662c820a2fe219272d19ff11c6f74a3dccb696940ea54ff7e",
+        "3e41028b3079cb8883000d267396973f56bb5d5e1870955cb1d89e9fb4565abf",
+        "6756a25d80190e9a8be23d1a6c894c30f79e7513a581bf7d7913131c4a03f090",
+        "6bcfce9165804dc6811409f56366e0f7e3f7289ec882c2c8cce2cacae102d423",
+        "aba52a48f4b5de2f69917bbb518a831836f6419107298a03f889b68123a06d5b",
+        "c073581d3b1e74101df270a296d350b6f41c6c7c91a443c7da070a319a0fe810",
+        "eb9adb98a42bb33f71be658e99d19cb43ff46a203b6371b582ed79abca9da2f5",
+    }
+    matched: dict[str, list[str]] = {}
+    for paragraph in paragraphs:
+        for candidate in _citation_candidates(paragraph):
+            payload = (
+                f"{paragraph['id']}:{candidate.start}:{candidate.end}:"
+                f"{candidate.raw_preview}"
+            )
+            digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+            if digest in reviewed_span_digests:
+                matched.setdefault(digest, []).append(candidate.kind)
+
+    assert set(matched) == reviewed_span_digests
+    assert all(kinds == ["parenthetical"] for kinds in matched.values())
+
+    assert sum(
+        finding["rule_id"] == "ER-CIT-NARRATIVE-001"
+        and finding["status"] == "ERROR"
+        for finding in private_audit["findings"]
+    ) == 0
 
 
 def test_private_multi_source_separator_is_attached_to_the_exact_candidate(

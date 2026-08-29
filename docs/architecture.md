@@ -71,6 +71,15 @@ cli.py
 
 Inspector 另输出统一 `body_blocks`，保留 paragraph/table 的真实 OOXML 顺序。表后第一个非空 `注：` 段只在无标题/新表/新图阻断时绑定，并保留 table ID、paragraph ID、距离和原因。表格/正文/表注相对字号由 effective run formatting 计算；混合或缺失证据为 unknown。
 
+## Note linkage 与 reference occurrence
+
+脚注和尾注使用同一套 identity 模型，但 definition-level 与 reference-position 规则分开裁决：
+
+- 唯一 definition 只要至少有一个匹配 reference，即可对其内容和格式检查一次；重复 reference 不会使 definition 本身的文字或字体变得未知。
+- 每个能解析到唯一 definition 的实际 reference occurrence 都保留 paragraph、run、occurrence、section 与 effective note properties，并分别执行适用的位置规则。
+- 重复 reference、重复 definition、缺失 definition 或未引用 definition 另产生 document-level linkage `MANUAL_REVIEW`，不会吞掉其他已确定结果。
+- 当前来源仅规定脚注每页重编号。尾注保留 `numFmt` / `numRestart` 及所属节证据，但没有来源支持时不借用脚注规则作确定性裁决。
+
 ## 双视图隐私边界
 
 `lint` 在内存中使用全文执行 citation/reference 识别。默认落盘前删除内容型 `text` / `deleted_text` / `full_text`，只保留最多 80 字的预览，同时保留编号等结构性文本。本地 hyperlink 与 field instruction 默认只保留类型、hash 和脱敏预览。绝对输入路径不进入 inspection 或 audit。

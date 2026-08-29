@@ -10,7 +10,10 @@ from collections.abc import Mapping, Sequence
 import re
 from typing import Any
 
-from economic_research_formatter.models.numbering import numbering_state
+from economic_research_formatter.models.numbering import (
+    numbering_state,
+    visible_reference_numbering_evidence,
+)
 
 from .common import (
     RuleContext,
@@ -723,6 +726,7 @@ def _heading_has_independent_level_evidence(paragraph: Mapping[str, Any]) -> boo
     if isinstance(evidence, Sequence) and not isinstance(evidence, (str, bytes)):
         if any(
             str(token).startswith("structural_level=")
+            or str(token) == "explicit_role_hint"
             for token in evidence
         ):
             return True
@@ -741,24 +745,47 @@ def _heading_has_independent_level_evidence(paragraph: Mapping[str, Any]) -> boo
     return any(numbering.get(key) is not None for key in ("ilvl", "level", "outline_level"))
 
 
-def _visible_only_level_jump(targets: Sequence[Mapping[str, Any]], ctx: RuleContext) -> bool:
-    """Return whether visible markers leave a non-adjacent hierarchy jump."""
+def _visible_only_jump_indexes(
+    targets: Sequence[Mapping[str, Any]],
+    ctx: RuleContext,
+) -> set[int]:
+    """Return visible-only targets participating in a non-adjacent jump."""
 
-    if not targets:
-        return False
-    levels: list[tuple[int, bool]] = []
-    for paragraph in targets:
+    levels: list[tuple[int, int, bool]] = []
+    for index, paragraph in enumerate(targets):
         role = ctx.role(paragraph)
         suffix = role.rsplit("_", 1)[-1]
         if suffix.isdigit():
-            levels.append((int(suffix), _heading_has_independent_level_evidence(paragraph)))
-    return any(
-        abs(current_level - previous_level) > 1
-        and not (previous_independent and current_independent)
-        for (previous_level, previous_independent), (current_level, current_independent) in zip(
-            levels, levels[1:]
-        )
-    )
+            levels.append(
+                (
+                    index,
+                    int(suffix),
+                    _heading_has_independent_level_evidence(paragraph),
+                )
+            )
+    ambiguous: set[int] = set()
+    for previous, current in zip(levels, levels[1:]):
+        previous_index, previous_level, previous_independent = previous
+        current_index, current_level, current_independent = current
+        if abs(current_level - previous_level) <= 1:
+            continue
+        if not previous_independent:
+            ambiguous.add(previous_index)
+        if not current_independent:
+            ambiguous.add(current_index)
+    return ambiguous
+
+
+def _ambiguous_heading_indexes(
+    targets: Sequence[Mapping[str, Any]],
+) -> set[int]:
+    """Return targets whose inferred level lacks independent evidence."""
+
+    return {
+        index
+        for index, paragraph in enumerate(targets)
+        if not _heading_has_independent_level_evidence(paragraph)
+    }
 
 
 def _hierarchy(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, Any]]:
@@ -785,9 +812,10 @@ def _hierarchy(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, Any]
         if len(lower_sequence) > 1 and not lower_req.get("level_4_prefix"):
             expected_by_level[4]["prefix"] = str(lower_sequence[1])
 
-    bad: list[dict[str, Any]] = []
+    violations_by_index: dict[int, dict[str, Any]] = {}
+    valid_by_index: dict[int, bool] = {}
     observed_levels: list[dict[str, Any]] = []
-    for paragraph in targets:
+    for target_index, paragraph in enumerate(targets):
         role = ctx.role(paragraph)
         level = int(role.rsplit("_", 1)[-1]) if role.rsplit("_", 1)[-1].isdigit() else None
         text = text_of(paragraph)
@@ -818,47 +846,72 @@ def _hierarchy(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, Any]
                 valid = valid and text_without_leading.startswith(expected_prefix)
         elif level in {3, 4} and expected_prefix:
             valid = text_without_leading.startswith(expected_prefix)
+        valid_by_index[target_index] = valid
         if not valid:
             violation = dict(heading_observed)
             violation["expected"] = expected
-            bad.append(violation)
-    if _visible_only_level_jump(targets, ctx):
-        first = targets[0]
-        return [
+            violations_by_index[target_index] = violation
+    ambiguous_indexes = _ambiguous_heading_indexes(targets)
+    jump_indexes = _visible_only_jump_indexes(targets, ctx)
+    results: list[dict[str, Any]] = []
+    for index, paragraph in enumerate(targets):
+        heading = observed_levels[index]
+        target = paragraph_target(paragraph, ctx.role(paragraph))
+        if index not in ambiguous_indexes:
+            violation = violations_by_index.get(index)
+            if violation is not None:
+                results.append(
+                    finding(
+                        rule,
+                        rule_severity(rule),
+                        "标题编号层级不符合来源规则；检测到论文式层级编号。",
+                        paragraph=paragraph,
+                        target=target,
+                        observed={
+                            "headings": [heading],
+                            "violations": [violation],
+                            "style": "thesis-style numbering",
+                            "leading_space_policy": "exactly two U+0020 characters; U+3000 is not silently treated as two U+0020 characters",
+                        },
+                    )
+                )
+            elif valid_by_index[index]:
+                results.append(
+                    finding(
+                        rule,
+                        "PASS",
+                        "标题层级编号符合规则。",
+                        paragraph=paragraph,
+                        target=target,
+                        observed={"headings": [heading]},
+                    )
+                )
+            continue
+        is_jump = index in jump_indexes
+        message = (
+            "仅检测到可见标题前缀，且层级发生跳级；无法可靠确定其真实层级，当前需人工复核。"
+            if is_jump
+            else "仅检测到可见标题前缀，缺少独立层级证据；无法可靠确定其真实层级，当前需人工复核。"
+        )
+        paragraph = targets[index]
+        results.append(
             finding(
                 rule,
                 "MANUAL_REVIEW",
-                "仅检测到可见标题前缀，且层级发生跳级；无法可靠确定其真实层级，当前需人工复核。",
-                paragraph=first,
-                target=paragraph_target(first, ctx.role(first)),
+                message,
+                paragraph=paragraph,
+                target=target,
                 observed={
-                    "headings": observed_levels,
+                    "headings": [heading],
+                    "ambiguous_heading": heading,
                     "hierarchy_evidence": "visible_prefix_only",
-                    "ambiguous_level_jump": True,
+                    "ambiguous_level_jump": is_jump,
                     "leading_space_policy": "exactly two U+0020 characters; U+3000 is not silently treated as two U+0020 characters",
                 },
                 confidence=0.50,
             )
-        ]
-    if bad:
-        first_bad = next((paragraph for paragraph in targets if paragraph.get("id") == bad[0].get("id")), targets[0])
-        return [
-            finding(
-                rule,
-                rule_severity(rule),
-                "标题编号层级不符合来源规则；检测到论文式层级编号。",
-                paragraph=first_bad,
-                target=paragraph_target(first_bad, ctx.role(first_bad)),
-                observed={
-                    "headings": observed_levels,
-                    "violations": bad,
-                    "style": "thesis-style numbering",
-                    "leading_space_policy": "exactly two U+0020 characters; U+3000 is not silently treated as two U+0020 characters",
-                },
-            )
-            for item in bad[:1]
-        ]
-    return [finding(rule, "PASS", "标题层级编号符合规则。", target=ctx.document_target, observed={"headings": observed_levels})]
+        )
+    return results
 
 
 def _equation(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, Any]]:
@@ -1139,7 +1192,6 @@ def _footnote_reference_restart_evidence(
         record["_story_index"] = order[0]
         paragraph_records.append(record)
     result: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str]] = set()
     for raw_paragraph in paragraph_records:
         paragraph_id = str(raw_paragraph.get("id", ""))
         values = raw_paragraph.get("footnote_reference_evidence", [])
@@ -1150,10 +1202,10 @@ def _footnote_reference_restart_evidence(
                 continue
             note_id = raw_reference.get("reference_id", raw_reference.get("id"))
             run_index = raw_reference.get("run_index", reference_index)
-            identity = (paragraph_id, str(note_id), str(run_index))
-            if identity in seen:
-                continue
-            seen.add(identity)
+            occurrence_index = raw_reference.get(
+                "occurrence_index",
+                raw_reference.get("reference_index", reference_index),
+            )
             effective = raw_reference.get("effective_properties")
             if not isinstance(effective, Mapping):
                 note_properties = raw_reference.get("note_properties")
@@ -1174,7 +1226,7 @@ def _footnote_reference_restart_evidence(
                     "target": {
                         "kind": "footnote_reference",
                         "id": (
-                            f"{paragraph_id}-footnote-{note_id}-run-{run_index}"
+                            f"{paragraph_id}-footnote-{note_id}-reference-{occurrence_index}"
                             if paragraph_id
                             else f"footnote-{note_id}-reference-{reference_index}"
                         ),
@@ -1186,6 +1238,7 @@ def _footnote_reference_restart_evidence(
                         "story_order": list(raw_paragraph.get("_story_order", ())),
                         "section_index": section_index,
                         "run_index": run_index,
+                        "occurrence_index": occurrence_index,
                     },
                     "restart": effective.get("numRestart"),
                     "property_evidence": dict(property_evidence),
@@ -1218,7 +1271,10 @@ def _footnote_numbering(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[
     active_reference_ids = {
         str(value)
         for issue in linkage_issues
-        for value in issue.get("active_reference_ids", [])
+        for value in issue.get(
+            "reference_position_checkable_ids",
+            issue.get("active_reference_ids", []),
+        )
     }
     if count == 0:
         if linkage_findings:
@@ -1235,15 +1291,6 @@ def _footnote_numbering(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[
             if str(record.get("target", {}).get("footnote_id"))
             in active_reference_ids
         ]
-        unique_records: list[dict[str, Any]] = []
-        seen_active_ids: set[str] = set()
-        for record in reference_records:
-            active_id = str(record.get("target", {}).get("footnote_id"))
-            if active_id in seen_active_ids:
-                continue
-            seen_active_ids.add(active_id)
-            unique_records.append(record)
-        reference_records = unique_records
     if reference_records:
         results: list[dict[str, Any]] = []
         for record in reference_records:
@@ -1388,7 +1435,84 @@ def _reference_entries(ctx: RuleContext) -> list[dict[str, Any]]:
 
 def _reference_layout(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, Any]]:
     targets = _reference_entries(ctx)
-    return _format_targets(rule, ctx, targets, missing_message="未识别到参考文献条目。")
+    if not targets:
+        return [
+            finding(
+                rule,
+                "NOT_APPLICABLE",
+                "未识别到参考文献条目。",
+                target=ctx.document_target,
+            )
+        ]
+    requirement = expected_for(rule)
+    results: list[dict[str, Any]] = []
+    for paragraph in targets:
+        checked = check_paragraph_format(
+            rule,
+            paragraph,
+            role=ctx.role(paragraph),
+        )
+        checked = _mark_numbering_evidence(checked, paragraph, requirement)
+        checked = _mark_unresolved_formatting(checked, paragraph, requirement)
+        numbering = _numbering_mapping(paragraph)
+        automatic = numbering_state(numbering)
+        visible = visible_reference_numbering_evidence(text_of(paragraph))
+        if isinstance(checked, Mapping):
+            observed = dict(checked.get("observed", {}))
+            mismatches = dict(checked.get("mismatches", {}))
+            unchecked = set(checked.get("unchecked", []))
+        else:
+            observed = observed_formatting(paragraph)
+            mismatches = {}
+            unchecked = set()
+        observed.update(visible)
+        observed["automatic_numbering_state"] = automatic
+        observed["numbered"] = automatic
+        if visible["visible_numbering"]:
+            mismatches["visible_numbering"] = {
+                "observed": True,
+                "expected": False,
+            }
+        target = paragraph_target(paragraph, ctx.role(paragraph))
+        if mismatches:
+            message = (
+                "参考文献条目包含可见手工序号或自动编号，不符合不标序号要求。"
+                if visible["visible_numbering"]
+                else mismatch_message(rule, mismatches)
+            )
+            results.append(
+                finding(
+                    rule,
+                    rule_severity(rule),
+                    message,
+                    paragraph=paragraph,
+                    target=target,
+                    observed=observed,
+                )
+            )
+        elif unchecked:
+            results.append(
+                finding(
+                    rule,
+                    "MANUAL_REVIEW",
+                    "该格式字段缺少可验证的 Inspector 证据，当前需人工复核。",
+                    paragraph=paragraph,
+                    target=target,
+                    observed=observed,
+                )
+            )
+        else:
+            results.append(
+                finding(
+                    rule,
+                    "PASS",
+                    f"{rule.get('target', '目标')}已满足规则要求。",
+                    paragraph=paragraph,
+                    target=target,
+                    observed=observed,
+                )
+            )
+    return results
 
 
 def _latin_font(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, Any]]:
@@ -1997,72 +2121,86 @@ def _table_rule(rule: Mapping[str, Any], ctx: RuleContext, *, notes: bool) -> li
     for target in targets:
         relation = paragraph_value(target, relation_key)
         normalized = _normalized_relation(relation)
-        observed = observed_formatting(target)
+        base_observed = observed_formatting(target)
         for key in ("table_note_binding", "font_size_comparison", "table_id", "table_note_candidate"):
             if target.get(key) is not None:
-                observed[key] = target[key]
+                base_observed[key] = target[key]
         if relation is not None:
-            observed[relation_key] = relation
-        if relation_required and (
+            base_observed[relation_key] = relation
+        relation_unknown = relation_required and (
             normalized in _UNKNOWN_RELATION_VALUES
             or target.get("comparison_status") in _UNKNOWN_RELATION_VALUES
-        ):
-            observed["comparison_status"] = normalized or target.get("comparison_status") or "unknown"
-            if target.get("font_size_comparison") is not None:
-                observed["font_size_comparison"] = target["font_size_comparison"]
-            results.append(
-                finding(
-                    rule,
-                    "MANUAL_REVIEW",
-                    "表格字号比较证据显示混合/未知状态，当前需人工复核。",
-                    paragraph=target,
-                    target=_table_finding_target(target, ctx),
-                    observed=observed,
-                    confidence=0.80,
-                )
-            )
-            continue
-        missing_fields = _missing_formatting_fields(target, requirement) if notes else []
-        if missing_fields:
-            observed["missing_formatting_evidence"] = missing_fields
-            results.append(
-                finding(
-                    rule,
-                    "MANUAL_REVIEW",
-                    "表格目标缺少规则要求的字体证据，当前需人工复核。",
-                    paragraph=target,
-                    target=_table_finding_target(target, ctx),
-                    observed=observed,
-                    confidence=0.80,
-                )
-            )
-            continue
+        )
+        missing_fields = (
+            _missing_formatting_fields(target, requirement)
+            if notes or relation_unknown
+            else []
+        )
         checked = check_paragraph_format(rule, target, role=ctx.role(target))
         checked = _mark_unresolved_formatting(checked, target, requirement)
-        if checked:
-            if checked.get("unchecked"):
-                results.append(
-                    finding(
-                        rule,
-                        "MANUAL_REVIEW",
-                        "表格字号缺少 Inspector 产生的可验证比较关系，当前需人工复核。",
-                        paragraph=target,
-                        target=_table_finding_target(target, ctx),
-                        observed=checked["observed"],
-                        confidence=0.80,
-                    )
+        if isinstance(checked, Mapping):
+            observed = {**base_observed, **dict(checked.get("observed", {}))}
+            mismatches = dict(checked.get("mismatches", {}))
+            unchecked = set(checked.get("unchecked", []))
+        else:
+            observed = base_observed
+            mismatches = {}
+            unchecked = set()
+        unresolved_fields: set[str] = set()
+        if relation_unknown:
+            mismatches.pop(relation_key, None)
+            unchecked.add(relation_key)
+            unresolved_fields.add(relation_key)
+            observed["comparison_status"] = (
+                normalized or target.get("comparison_status") or "unknown"
+            )
+            if target.get("font_size_comparison") is not None:
+                observed["font_size_comparison"] = target["font_size_comparison"]
+        if missing_fields:
+            for field in missing_fields:
+                mismatches.pop(field, None)
+            unchecked.update(missing_fields)
+            unresolved_fields.update(missing_fields)
+            observed["missing_formatting_evidence"] = missing_fields
+        formatting_unknown = observed.get("unresolved_formatting_fields", [])
+        if isinstance(formatting_unknown, Sequence) and not isinstance(
+            formatting_unknown, (str, bytes)
+        ):
+            unresolved_fields.update(str(value) for value in formatting_unknown)
+        if unresolved_fields:
+            observed["unresolved_fields"] = sorted(unresolved_fields)
+        if unchecked:
+            observed["unchecked_fields"] = sorted(unchecked)
+        finding_target = _table_finding_target(target, ctx)
+        if mismatches:
+            results.append(
+                finding(
+                    rule,
+                    rule_severity(rule),
+                    mismatch_message(rule, mismatches),
+                    paragraph=target,
+                    target=finding_target,
+                    observed=observed,
                 )
+            )
+        elif unchecked:
+            if relation_unknown:
+                message = "表格字号比较证据显示混合/未知状态，当前需人工复核。"
+            elif missing_fields:
+                message = "表格目标缺少规则要求的字体证据，当前需人工复核。"
             else:
-                results.append(
-                    finding(
-                        rule,
-                        rule_severity(rule),
-                        mismatch_message(rule, checked["mismatches"]),
-                        paragraph=target,
-                        target=_table_finding_target(target, ctx),
-                        observed=checked["observed"],
-                    )
+                message = "表格字号缺少 Inspector 产生的可验证比较关系，当前需人工复核。"
+            results.append(
+                finding(
+                    rule,
+                    "MANUAL_REVIEW",
+                    message,
+                    paragraph=target,
+                    target=finding_target,
+                    observed=observed,
+                    confidence=0.80,
                 )
+            )
         else:
             results.append(
                 finding(
@@ -2070,7 +2208,7 @@ def _table_rule(rule: Mapping[str, Any], ctx: RuleContext, *, notes: bool) -> li
                     "PASS",
                     f"{rule.get('target', '目标')}已满足规则要求。",
                     paragraph=target,
-                    target=_table_finding_target(target, ctx),
+                    target=finding_target,
                     observed=observed or {"formatting": True},
                 )
             )

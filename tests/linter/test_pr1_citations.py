@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from economic_research_formatter.docx.inspector import inspect_docx
 from economic_research_formatter.lint.engine import lint_inspection
 
@@ -85,11 +87,129 @@ def test_supported_citation_forms_are_candidates_but_ordinary_year_ranges_are_no
     assert _citation_candidates({"id": "p-year", "text": "本期数据截至2020年。"}) == []
 
 
+def test_parenthetical_content_wins_before_narrative_author_arbitration() -> None:
+    from economic_research_formatter.lint.citations import _citation_candidates
+
+    cases = (
+        ("研究工作（Foxman, 2016）。", "parenthetical"),
+        ("理论框架（Akerlof，1978）。", "parenthetical"),
+        ("相关信息（Brown et al.，2025）。", "parenthetical"),
+        ("减值测试等（秦荣生，2025）。", "parenthetical"),
+        ("诉讼风险（姜涛和尚鼎，2020）。", "parenthetical"),
+        ("Abis and Veldkamp (2022) 指出……", "narrative"),
+        ("Cao et al.（2023）发现……", "narrative"),
+        ("张三（2020）指出……", "narrative"),
+    )
+
+    for index, (text, expected_kind) in enumerate(cases):
+        candidates = _citation_candidates({"id": f"p-arbitration-{index}", "text": text})
+        assert len(candidates) == 1
+        assert candidates[0].kind == expected_kind
+
+    for text in (
+        "会议时间 (September 2002)。",
+        "会议时间 (9 September 2002)。",
+        "会议时间 (September 9, 2002)。",
+    ):
+        assert _citation_candidates({"id": "p-month", "text": text}) == []
+
+    multisource = _citation_candidates(
+        {
+            "id": "p-multisource",
+            "text": "错报迹象(Dechow et al., 2011；Kothari et al., 2005)。",
+        }
+    )
+    assert len(multisource) == 1
+    assert multisource[0].kind == "parenthetical"
+    assert multisource[0].page is None
+
+    later_source_page = _citation_candidates(
+        {
+            "id": "p-multisource-page",
+            "text": "(Dechow et al., 2011；Kothari et al., 2005, p. 9)",
+        }
+    )
+    assert len(later_source_page) == 1
+    assert later_source_page[0].kind == "parenthetical"
+    assert later_source_page[0].year == "2011"
+    assert later_source_page[0].page is None
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_year", "expected_page"),
+    [
+        ("张三（2020）", "2020", None),
+        ("张三（2020a）", "2020a", None),
+        ("Smith (2020, p. 15)", "2020", "15"),
+        ("张三（2020：15）", "2020", "15"),
+    ],
+)
+def test_narrative_parentheses_require_year_only_semantics(
+    text: str,
+    expected_year: str,
+    expected_page: str | None,
+) -> None:
+    from economic_research_formatter.lint.citations import _citation_candidates
+
+    candidates = _citation_candidates({"id": "p-year-only", "text": text})
+
+    assert len(candidates) == 1
+    assert candidates[0].kind == "narrative"
+    assert candidates[0].year == expected_year
+    assert candidates[0].page == expected_page
+
+
+def test_parenthetical_examples_never_become_narrative_rule_targets() -> None:
+    texts = (
+        "研究工作（Foxman, 2016）。",
+        "理论框架（Akerlof，1978）。",
+        "相关信息（Brown et al.，2025）。",
+        "减值测试等（秦荣生，2025）。",
+        "诉讼风险（姜涛和尚鼎，2020）。",
+        "Abis and Veldkamp (2022) 指出……",
+        "Cao et al.（2023）发现……",
+        "张三（2020）指出……",
+    )
+    audit = lint_inspection(_inspection(*texts))
+    narrative = [
+        item for item in audit["findings"]
+        if item["rule_id"] == "ER-CIT-NARRATIVE-001"
+    ]
+
+    assert {item["status"] for item in narrative} == {"PASS"}
+    assert {item["target"]["id"] for item in narrative} == {
+        "p-000005",
+        "p-000006",
+        "p-000007",
+    }
+    assert _statuses(audit, "ER-CIT-GENERAL-001") == {"PASS"}
+    assert _statuses(audit, "ER-CIT-GENERAL-002") == {"PASS"}
+    assert _statuses(audit, "ER-CIT-EN-TWOAUTHORS-001") == {"ERROR"}
+
+
 def test_narrative_parser_does_not_promote_prose_labels_to_authors() -> None:
     from economic_research_formatter.lint.citations import _citation_candidates
 
-    assert _citation_candidates({"id": "p-result", "text": "研究结果（2020）显示……"}) == []
+    for text in (
+        "研究结果（2020）显示……",
+        "公司成立（2020）后……",
+        "收入增长（2020）较快……",
+        "市场规模（2020）扩大……",
+        "财政年度（2020）结束……",
+        "治理水平（2020）提高……",
+        "研究工作（2020）继续……",
+        "理论框架（2020）如下……",
+        "何种（2020）情况……",
+        "何时（2020）发生……",
+        "高于（2020）水平……",
+        "曾在（2020）出现……",
+    ):
+        assert _citation_candidates({"id": "p-prose-label", "text": text}) == []
     assert _citation_candidates({"id": "p-body", "text": "本文使用张三（2020）的数据。"})[0].authors == ("张三",)
+    assert _citation_candidates({"id": "p-two", "text": "何威风与刘启亮（2010）指出……"})[0].authors == (
+        "何威风",
+        "刘启亮",
+    )
     assert _citation_candidates({"id": "p-english", "text": "This (2020) is a result."}) == []
 
 

@@ -41,6 +41,54 @@ YEAR_RE = re.compile(r"(?:19|20)\d{2}[a-zA-Z]?")
 PAREN_RE = re.compile(r"[（(]([^（）()]*(?:19|20)\d{2}[^（）()]*)[）)]")
 EN_NAME = r"[A-Z][A-Za-zÀ-ÖØ-öø-ÿ'’-]+"
 ZH_NAME = r"[\u4e00-\u9fff]{2,4}"
+_PAGE_NUMBER = r"\d+(?:\s*[-—–]\s*\d+)?"
+_NARRATIVE_YEAR_ONLY_RE = re.compile(
+    rf"^\s*(?P<year>{YEAR_RE.pattern})"
+    rf"(?:\s*[,，:：]\s*(?:(?:pp?\.?)\s*|第\s*)?"
+    rf"(?P<page>{_PAGE_NUMBER})\s*(?:页)?)?\s*$",
+    re.IGNORECASE,
+)
+_MONTH_NAME = (
+    r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+    r"Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|"
+    r"Dec(?:ember)?)"
+)
+_MONTH_YEAR_RE = re.compile(
+    rf"^\s*(?:{_MONTH_NAME}\.?(?:\s*,)?\s+"
+    rf"(?:\d{{1,2}}\s*,?\s*)?|\d{{1,2}}\s+{_MONTH_NAME}\.?\s+)"
+    rf"(?:19|20)\d{{2}}\s*$",
+    re.IGNORECASE,
+)
+_ZH_SINGLE_SURNAMES = frozenset(
+    "赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜"
+    "戚谢邹喻柏窦章苏潘葛范彭郎鲁韦昌马苗方俞任袁柳鲍史唐费廉岑薛雷"
+    "贺倪汤滕殷罗毕郝邬安常乐于傅卞齐康伍余顾孟平黄穆萧尹姚邵汪祁毛"
+    "米贝臧戴宋熊纪舒屈项祝董梁杜阮蓝闵席季麻强贾路江童颜郭梅林钟徐"
+    "邱骆高夏蔡田樊胡凌霍万柯卢莫解应宗丁宣邓郁单杭洪包左石崔吉龚程"
+    "裴陆荣翁荀甄曲封储靳井段富巫乌焦侯全班秋仲伊宫宁仇栾甘祖武符刘"
+    "景詹龙叶黎乔闻党翟谭贡劳姬申冉宰雍桑桂牛寿边温庄晏柴瞿阎连艾向"
+    "古易慎廖耿匡文寇广聂辛简饶曾沙关查游权益尚琚"
+)
+_ZH_COMPOUND_SURNAMES = (
+    "欧阳",
+    "司马",
+    "上官",
+    "诸葛",
+    "东方",
+    "皇甫",
+    "尉迟",
+    "公孙",
+    "慕容",
+    "宇文",
+    "长孙",
+    "司徒",
+    "司空",
+    "令狐",
+    "夏侯",
+    "钟离",
+    "南宫",
+)
+_ZH_NARRATIVE_NON_NAMES = frozenset({"何种", "何时", "高于", "曾在"})
 
 _ZH_AUTHOR_STOP_SUFFIXES = (
     "本文",
@@ -66,7 +114,7 @@ _ZH_AUTHOR_STOP_SUFFIXES = (
     "作者",
 )
 _NARRATIVE_AUTHOR_YEAR_RE = re.compile(
-    rf"(?P<authors>{EN_NAME}(?:\s+(?:and|&)\s+{EN_NAME}|\s+et\s+al\.)?|"
+    rf"(?:参考\s*)?(?P<authors>{EN_NAME}(?:\s+(?:and|&)\s+{EN_NAME}|\s+et\s+al\.)?|"
     rf"{ZH_NAME}(?:\s*(?:和|与|及)\s*{ZH_NAME}|等)?)"
     rf"\s*[（(]\s*(?P<content>[^（）()]*?{YEAR_RE.pattern}[^（）()]*)[）)]"
 )
@@ -130,6 +178,8 @@ def _author_tokens(value: str) -> tuple[str, ...]:
             cjk_tokens = re.findall(r"[\u4e00-\u9fff]{2,4}", piece)
             if cjk_tokens and all(len(token) <= 4 for token in cjk_tokens):
                 tokens.extend(cjk_tokens)
+            elif re.fullmatch(rf"{EN_NAME}(?:\s+et\s+al\.)?", piece, re.IGNORECASE):
+                tokens.extend(re.findall(EN_NAME, piece))
         return tuple(tokens)
     return tuple(re.findall(EN_NAME, value))
 
@@ -140,8 +190,31 @@ def _year_and_page(content: str) -> tuple[str | None, str | None]:
         return None, None
     year = year_match.group(0)
     after_year = content[year_match.end() :]
-    page_match = re.search(r"(?:\bpp?\.?\s*)?(\d+\s*[-—–]\s*\d+|\d+)", after_year, re.IGNORECASE)
+    explicit_page_match = re.search(
+        rf"(?:\bpp?\.?\s*|第\s*)({_PAGE_NUMBER})\s*(?:页)?",
+        after_year,
+        re.IGNORECASE,
+    )
+    next_year = YEAR_RE.search(after_year)
+    if explicit_page_match is not None and (
+        next_year is None or explicit_page_match.start() < next_year.start()
+    ):
+        return year, explicit_page_match.group(1)
+    page_search_area = after_year[: next_year.start()] if next_year is not None else after_year
+    page_match = re.search(rf"({_PAGE_NUMBER})", page_search_area)
     return year, page_match.group(1) if page_match else None
+
+
+def _narrative_year_and_page(content: str) -> tuple[str | None, str | None]:
+    """Return fields only when narrative parentheses contain year/page data."""
+
+    if _NARRATIVE_YEAR_ONLY_RE.fullmatch(content) is None:
+        return None, None
+    return _year_and_page(content)
+
+
+def _spans_overlap(start: int, end: int, other_start: int, other_end: int) -> bool:
+    return start < other_end and other_start < end
 
 
 def _candidate_from_span(
@@ -187,9 +260,27 @@ def _narrative_match_text(text: str, match: re.Match[str]) -> tuple[int, str]:
     return start, author_text
 
 
+def _is_high_confidence_zh_name(value: str) -> bool:
+    """Return whether a compact CJK token has positive personal-name evidence."""
+
+    value = value.strip()
+    if re.fullmatch(r"[\u4e00-\u9fff]{2,4}", value) is None:
+        return False
+    if value in _ZH_NARRATIVE_NON_NAMES:
+        return False
+    for surname in _ZH_COMPOUND_SURNAMES:
+        if value.startswith(surname):
+            return len(value) in {3, 4}
+    return len(value) in {2, 3} and value[0] in _ZH_SINGLE_SURNAMES
+
+
 def _narrative_author_tokens(author_text: str) -> tuple[str, ...]:
     if re.search(r"[\u4e00-\u9fff]", author_text):
         if any(author_text.endswith(suffix) for suffix in _NARRATIVE_STOP_SUFFIXES):
+            return ()
+        normalized = re.sub(r"\s*等\s*$", "", author_text.strip())
+        name_parts = re.split(r"\s*(?:和|与|及)\s*", normalized)
+        if not name_parts or not all(_is_high_confidence_zh_name(part) for part in name_parts):
             return ()
     authors = _author_tokens(author_text)
     if authors and all(author.casefold() in _COMMON_AUTHOR_WORDS for author in authors):
@@ -202,48 +293,15 @@ def _citation_candidates(paragraph: Mapping[str, Any]) -> list[CitationCandidate
 
     text = text_of(paragraph)
     candidates: list[CitationCandidate] = []
-    narrative_spans: list[tuple[int, int]] = []
-    for match in _NARRATIVE_AUTHOR_YEAR_RE.finditer(text):
-        start, author_text = _narrative_match_text(text, match)
-        full_open = text.find("(", match.start(0), match.end(0))
-        full_open = full_open if full_open >= 0 else text.find("（", match.start(0), match.end(0))
-        if full_open < 0:
-            continue
-        content = match.group("content")
-        content_years = list(YEAR_RE.finditer(content))
-        content_before_year = content[: content_years[0].start()] if content_years else content
-        # In ``(Smith, 2020)`` the preceding prose may itself end in CJK
-        # characters, which can superficially match the narrative pattern.
-        # A narrative citation has a year (and optional page) in its
-        # parentheses, not a second author token.
-        if _author_tokens(content_before_year) and match.group("authors") in _NARRATIVE_PREFIXES:
-            continue
-        year, page = _year_and_page(content)
-        if year is None:
-            continue
-        authors = _narrative_author_tokens(author_text)
-        if not authors:
-            continue
-        end = match.end(0)
-        narrative_spans.append((start, end))
-        candidates.append(
-            _candidate_from_span(
-                paragraph,
-                kind="narrative",
-                start=start,
-                end=end,
-                authors=authors,
-                year=year,
-                page=page,
-                confidence=0.96,
-            )
-        )
+    parenthetical_spans: list[tuple[int, int]] = []
 
+    # Bracket contents are authoritative for candidate arbitration.  When an
+    # enclosed span already contains an author and year it is parenthetical;
+    # nearby prose must not be promoted to a narrative author and then hide the
+    # more precise bracket target.
     for match in PAREN_RE.finditer(text):
         content = match.group(1)
         if not _looks_like_author_parenthetical(content):
-            continue
-        if any(match.start() >= start and match.end() <= end for start, end in narrative_spans):
             continue
         year, page = _year_and_page(content)
         if year is None:
@@ -253,6 +311,7 @@ def _citation_candidates(paragraph: Mapping[str, Any]) -> list[CitationCandidate
         authors = _author_tokens(before_year)
         if not authors:
             continue
+        parenthetical_spans.append((match.start(), match.end()))
         candidates.append(
             _candidate_from_span(
                 paragraph,
@@ -266,13 +325,49 @@ def _citation_candidates(paragraph: Mapping[str, Any]) -> list[CitationCandidate
             )
         )
 
+    for match in _NARRATIVE_AUTHOR_YEAR_RE.finditer(text):
+        start, author_text = _narrative_match_text(text, match)
+        full_open = text.find("(", match.start(0), match.end(0))
+        full_open = full_open if full_open >= 0 else text.find("（", match.start(0), match.end(0))
+        if full_open < 0:
+            continue
+        bracket_end = match.end(0)
+        if any(
+            _spans_overlap(full_open, bracket_end, span_start, span_end)
+            for span_start, span_end in parenthetical_spans
+        ):
+            continue
+        content = match.group("content")
+        year, page = _narrative_year_and_page(content)
+        if year is None:
+            continue
+        authors = _narrative_author_tokens(author_text)
+        if not authors:
+            continue
+        end = match.end(0)
+        candidates.append(
+            _candidate_from_span(
+                paragraph,
+                kind="narrative",
+                start=start,
+                end=end,
+                authors=authors,
+                year=year,
+                page=page,
+                confidence=0.96,
+            )
+        )
+
     # Preserve a conservative candidate when a compact preview ends before a
     # closing parenthesis.  There is no reliable narrative span in that case.
     for match in re.finditer(r"[（(]([^（）()]*(?:19|20)\d{2}[^（）()]*)$", text):
         content = match.group(1)
         if not _looks_like_author_parenthetical(content):
             continue
-        if any(match.start() >= candidate.start and match.end() <= candidate.end for candidate in candidates):
+        if any(
+            _spans_overlap(match.start(), match.end(), candidate.start, candidate.end)
+            for candidate in candidates
+        ):
             continue
         year, page = _year_and_page(content)
         years = list(YEAR_RE.finditer(content))
@@ -328,6 +423,8 @@ def _looks_like_author_parenthetical(content: str) -> bool:
     content = content.strip()
     if not content:
         return False
+    if _MONTH_YEAR_RE.fullmatch(content):
+        return False
     years = list(YEAR_RE.finditer(content))
     if not years:
         return False
@@ -347,7 +444,10 @@ def _looks_like_author_parenthetical(content: str) -> bool:
     # prevents phrases such as ``本文使用2010`` from becoming a citation when
     # they are enclosed in punctuation by the source document.
     chinese_tokens = re.findall(r"[\u4e00-\u9fff]+", before_year)
-    if chinese_tokens and not re.search(r"[\u4e00-\u9fff]{2,4}(?:等)?$", before_year):
+    if chinese_tokens and not (
+        re.search(r"[\u4e00-\u9fff]{2,4}(?:等)?$", before_year)
+        or re.search(rf"{EN_NAME}(?:\s+et\s+al\.)?\s*等$", before_year, re.IGNORECASE)
+    ):
         return False
     authors = _author_tokens(before_year)
     if authors and all(author.casefold() in _COMMON_AUTHOR_WORDS for author in authors):

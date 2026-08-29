@@ -3,7 +3,22 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import re
 from typing import Any
+
+
+_VISIBLE_REFERENCE_NUMBER_RE = re.compile(
+    r"^(?P<leading>[ \u3000]*)"
+    r"(?P<marker>"
+    r"\[[1-9]\d*\]"
+    r"|［[1-9]\d*］"
+    r"|【[1-9]\d*】"
+    r"|\([1-9]\d*\)"
+    r"|（[1-9]\d*）"
+    r"|[1-9]\d*[.．、]"
+    r")"
+    r"(?=\s|[A-Za-z\u4e00-\u9fff])"
+)
 
 
 def numbering_state(value: Any) -> bool | None:
@@ -30,4 +45,24 @@ def numbering_state(value: Any) -> bool | None:
     return None
 
 
-__all__ = ["numbering_state"]
+def visible_reference_numbering_evidence(text: Any) -> dict[str, Any]:
+    """Return conservative visible numbering evidence from reference text."""
+
+    raw = text if isinstance(text, str) else str(text or "")
+    match = _VISIBLE_REFERENCE_NUMBER_RE.match(raw)
+    if match is None:
+        return {
+            "visible_numbering": False,
+            "visible_marker": None,
+            "visible_marker_span": None,
+            "evidence_source": "reference_text_prefix",
+        }
+    return {
+        "visible_numbering": True,
+        "visible_marker": match.group("marker"),
+        "visible_marker_span": [match.start("marker"), match.end("marker")],
+        "evidence_source": "reference_text_prefix",
+    }
+
+
+__all__ = ["numbering_state", "visible_reference_numbering_evidence"]
