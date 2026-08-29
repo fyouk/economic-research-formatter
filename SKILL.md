@@ -2,7 +2,7 @@
 
 ## 目标
 
-根据仓库中的已验证来源和原子规则，对 Word 论文执行“检查 → 安全修复 → 再检查”。
+根据仓库中的已验证来源和原子规则，对 Word 论文执行“只读扫描 → 语义分类 → 规则审计”。当前版本不修改 DOCX。
 
 ## 不可违反的原则
 
@@ -13,9 +13,10 @@
 5. 不静默解决 `conflicts.yaml` 中尚未裁决的冲突。
 6. 能保留 Zotero / EndNote / Word 字段时，不得把动态字段扁平化为普通文本。
 7. 不重建整篇 DOCX 来实现普通格式修改；应尽量原位修改样式/OOXML。
-8. 原始文件不得被覆盖；输出新文件。
-9. 修改后必须重新运行 Linter。
-10. 当规范无法支持某项判断时，输出 `NOT_CHECKED` 或 `MANUAL_REVIEW`，而不是猜测。
+8. 原始文件不得被覆盖或改写。
+9. 当规范无法支持某项判断时，输出 `NOT_CHECKED` 或 `MANUAL_REVIEW`，而不是猜测。
+10. 当文档中不存在该类目标时，输出 `NOT_APPLICABLE`，不得写成 `PASS`。
+11. 默认报告只保留截断文本预览；全文仅在显式 `--include-text` 时落盘。
 
 ## 规则来源
 
@@ -28,7 +29,7 @@
 
 仅在需要核对原文时读取 `sources/raw/`。
 
-## 推荐执行流程
+## 当前可执行流程
 
 ### Step 1 — Inspect
 
@@ -57,7 +58,7 @@ role: heading_level_2
 confidence: 0.94
 ```
 
-低置信度结构不得直接应用高风险修复。
+低置信度结构不得作为确定性违规结论，应进入人工复核。
 
 ### Step 3 — Lint
 
@@ -69,39 +70,32 @@ confidence: 0.94
 - `INFO`
 - `MANUAL_REVIEW`
 - `NOT_CHECKED`
+- `NOT_APPLICABLE`
 
-### Step 4 — Safe Fix
+`NOT_APPLICABLE` 表示文档中没有该类目标；`NOT_CHECKED` 表示能力、未决项或冲突阻止了自动检查。
 
-只自动执行：
+### Step 4 — Report
 
-- `autofix: safe`
-- 或已满足规则中全部 `preconditions` 的 `autofix: conditional`
+输出：
 
-`autofix: never` 只能报告。
+```text
+inspection.json
+audit.json
+audit.md
+```
 
-### Step 5 — Re-lint
+JSON 保留逐目标 finding，Markdown 按 rule ID 和状态聚合重复问题。
 
-重新读取修改后的 DOCX，不能用“调用成功”代替验收。
+## 未开放流程
 
-### Step 6 — Visual verification
-
-当实现渲染能力后，将 DOCX 渲染为页面图像，检查：
-
-- 分页异常
-- 表格截断
-- 图片遮挡
-- 公式裁切
-- 标题孤立
-- 字体回退
-- 页眉页脚异常
+Safe Fix、Re-lint 和页面渲染验收属于后续里程碑。当前不得执行 `autofix: safe/conditional`，也不得生成修改后 DOCX。
 
 ## 输出
 
 至少生成：
 
 ```text
-paper_economic_research.docx
-paper_audit.json
-paper_audit.md
-paper_manual_review.md
+inspection.json
+audit.json
+audit.md
 ```

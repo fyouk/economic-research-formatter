@@ -33,6 +33,14 @@ rule_schema:
       - safe
       - conditional
       - never
+  statuses:
+    conflict:
+      - unresolved_overlap
+      - unresolved
+      - source_example_vs_explicit_annotation
+    unresolved:
+      - not_specified_in_current_sources
+      - example_present_but_red_annotation_not_explicit
 
   conventions:
     rule_id: "ER-{MS|CIT|REF}-{TOPIC}-{NNN}"

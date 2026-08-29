@@ -1,6 +1,9 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
 .venv/
 venv/
 dist/
@@ -9,3 +12,8 @@ build/
 .DS_Store
 outputs/
 ~$*.docx
+tests/private/
+artifacts/
+reports/private/
+*.private.audit.json
+*.private.audit.md

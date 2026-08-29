@@ -5,10 +5,19 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "economic-research-formatter"
 version = "0.1.0"
-description = "Rule-driven DOCX linter and safe formatter for Economic Research manuscripts"
+description = "Rule-driven read-only DOCX inspector and linter for Economic Research manuscripts"
 requires-python = ">=3.10"
 dependencies = [
   "PyYAML>=6.0",
+  "python-docx>=1.1",
+  "lxml>=5.0",
+  "Pillow>=10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-cov>=5.0",
 ]
 
 [project.scripts]
@@ -16,3 +25,19 @@ er-format = "economic_research_formatter.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "tests"]
+addopts = "-ra --import-mode=importlib"
+markers = [
+  "private: requires ER_PRIVATE_FIXTURE and never runs against committed data",
+]
+
+[tool.coverage.run]
+source = ["economic_research_formatter"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
