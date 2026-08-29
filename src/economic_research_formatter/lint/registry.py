@@ -11,6 +11,7 @@ import yaml
 from economic_research_formatter.rule_loader import (
     ensure_rules_valid,
     load_rules as _load_rules,
+    project_root as _profile_root,
 )
 
 
@@ -18,7 +19,7 @@ RULE_FILENAMES = ("manuscript.yaml", "citations.yaml", "references.yaml")
 
 
 def project_root() -> Path:
-    return Path(__file__).resolve().parents[3]
+    return _profile_root()
 
 
 def _load_yaml(path: Path, default: dict[str, Any]) -> dict[str, Any]:

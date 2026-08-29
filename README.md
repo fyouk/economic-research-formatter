@@ -28,7 +28,9 @@
 - 严格规则结构、引用与跨文件校验
 - Lint 执行前的严格规则门禁与未决冲突隔离
 - DOCX/OOXML 只读结构扫描
+- 统一 body block 顺序、相邻表注绑定与真实相对字号证据
 - 确定性语义分类
+- parenthetical / narrative / unknown 引文候选模型与脚注引文检查
 - Manuscript / Citation / Reference Linter v1
 - 确定性 JSON 和中文 Markdown 审计报告
 - ZIP/XML/图像资源上限与默认隐私脱敏
@@ -72,6 +74,7 @@ economic-research-formatter/
 │   ├── classify/             # 确定性语义分类
 │   ├── lint/                 # 规则执行
 │   ├── models/               # 稳定输出模型
+│   ├── profiles/             # wheel 内置规则 profile
 │   ├── report/               # JSON / Markdown
 │   ├── cli.py
 │   └── rule_loader.py
@@ -122,11 +125,22 @@ unknown         当前来源未规定
 
 Python 要求：`>=3.10`。
 
+从完整源码树安装（pip 会先构建 wheel）：
+
+```bash
+python -m pip install .
+```
+
+本地开发：
+
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -e '.[dev]'
+python -m build
 ```
+
+wheel 内包含《经济研究》profile，console script 可在仓库 checkout 之外运行。顶层 `rules/` 是便于人工维护的源树，测试会逐字节验证它与 package profile 同步。
 
 ## CLI
 
@@ -149,6 +163,12 @@ er-format inspect INPUT.docx --output inspection.json
 er-format inspect INPUT.docx --output inspection.json --include-text
 ```
 
+Word 核心属性默认脱敏，`--include-text` 不会同时授权元数据。确需保留明文属性时单独使用：
+
+```bash
+er-format inspect INPUT.docx --output inspection.json --include-metadata
+```
+
 ### 执行格式审计
 
 ```bash
@@ -164,6 +184,8 @@ reports/audit/audit.md
 ```
 
 `lint` 会在内存中读取全文以识别文内引用，但默认写出的 `inspection.json` 仍仅包含截断预览。如果审计发现 `ERROR`，命令返回 1；执行失败返回 2。探索性审计可使用 `--exit-zero`。
+
+Latin-font v1 覆盖 body paragraph、table cell paragraph 和 footnote paragraph。Header/footer 内部文本、text box/drawing text 与 embedded chart 尚未进入该规则的字符级检查。
 
 ## 结果状态
 
@@ -222,6 +244,10 @@ python -m pytest -q tests/integration/test_private_fixture.py
 ## 开发验证
 
 ```bash
+ruff check src tests scripts
 python -m pytest -q
+python -m pytest --cov=economic_research_formatter --cov-report=term-missing
 python -m economic_research_formatter.cli validate-rules
+python -m build
+python scripts/wheel_smoke.py dist/*.whl
 ```

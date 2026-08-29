@@ -14,6 +14,7 @@ _FONT_ATTRIBUTES = ("eastAsia", "ascii", "hAnsi", "cs")
 _FORMAT_KEYS = ("font", "size_pt", "size_cs_pt", "bold", "italic", "underline", "color", "highlight", "vert_align")
 _INDENT_KEYS = ("left_twips", "right_twips", "first_line_twips", "hanging_twips")
 _SPACING_KEYS = ("before_twips", "after_twips", "line_raw", "line_rule")
+_UNRESOLVED_THEME = object()
 
 
 def _float_or_none(value: str | None) -> float | None:
@@ -134,6 +135,15 @@ def parse_rpr(rpr: etree._Element | None) -> dict[str, Any]:
     vertical = rpr.find(qname(W_NS, "vertAlign"))
     if vertical is not None:
         result["vert_align"] = vertical.get(qname(W_NS, "val"))
+    language = rpr.find(qname(W_NS, "lang"))
+    if language is not None:
+        values = {
+            key: language.get(qname(W_NS, key))
+            for key in ("val", "eastAsia", "bidi")
+            if language.get(qname(W_NS, key)) is not None
+        }
+        if values:
+            result["lang"] = values
     return result
 
 
@@ -143,9 +153,14 @@ class StyleResolver:
     def __init__(self, package: DocxPackage) -> None:
         self.package = package
         self.styles: dict[str, dict[str, Any]] = {}
+        self.default_style_ids: dict[str, str | None] = {
+            "paragraph": None,
+            "character": None,
+        }
         self.doc_defaults: dict[str, Any] = {}
         self.doc_defaults_ppr: dict[str, Any] = {}
         self.theme_fonts: dict[str, str] = {}
+        self.theme_script_fonts: dict[tuple[str, str], str] = {}
         self._load()
 
     def _load(self) -> None:
@@ -169,28 +184,47 @@ class StyleResolver:
                     "id": style_id,
                     "name": name_element.get(qname(W_NS, "val")) if name_element is not None else style_id,
                     "type": style.get(qname(W_NS, "type")),
+                    "default": style.get(qname(W_NS, "default")) in {"1", "true", "on"},
                     "based_on": based_on.get(qname(W_NS, "val")) if based_on is not None else None,
                     "rpr": parse_rpr(style.find(qname(W_NS, "rPr"))),
                     "ppr": style.find(qname(W_NS, "pPr")),
                 }
+                style_type = self.styles[style_id]["type"]
+                if self.styles[style_id]["default"] and style_type in self.default_style_ids:
+                    # Word permits one default style for each type.  Keep the
+                    # first one deterministically if a malformed package
+                    # contains duplicates rather than letting ZIP/XML order
+                    # change the effective formatting silently.
+                    if self.default_style_ids[style_type] is None:
+                        self.default_style_ids[style_type] = style_id
         theme = self.package.xml("word/theme/theme1.xml")
         if theme is not None:
+            drawingml_ns = "http://schemas.openxmlformats.org/drawingml/2006/main"
             font_scheme = theme.find(
-                ".//{http://schemas.openxmlformats.org/drawingml/2006/main}fontScheme"
+                f".//{{{drawingml_ns}}}fontScheme"
             )
             if font_scheme is not None:
                 for group_name, group_key in (("majorFont", "major"), ("minorFont", "minor")):
                     group = font_scheme.find(
-                        f"{{http://schemas.openxmlformats.org/drawingml/2006/main}}{group_name}"
+                        f"{{{drawingml_ns}}}{group_name}"
                     )
                     if group is None:
                         continue
                     for child_name, language_key in (("latin", "latin"), ("ea", "eastAsia"), ("cs", "cs")):
                         child = group.find(
-                            f"{{http://schemas.openxmlformats.org/drawingml/2006/main}}{child_name}"
+                            f"{{{drawingml_ns}}}{child_name}"
                         )
                         if child is not None and child.get("typeface"):
                             self.theme_fonts[f"{group_key}{language_key[:1].upper()}{language_key[1:]}"] = child.get("typeface")
+                    for child in group.findall(f"{{{drawingml_ns}}}font"):
+                        script = child.get("script")
+                        typeface = child.get("typeface")
+                        if script and typeface:
+                            # Script-specific fonts are intentionally kept
+                            # separate from the generic eastAsia token.  The
+                            # latter does not identify Hans versus Hant, so it
+                            # must not select one arbitrarily.
+                            self.theme_script_fonts[(group_key, script)] = typeface
 
     def style_name(self, style_id: str | None) -> str | None:
         if style_id is None:
@@ -216,6 +250,16 @@ class StyleResolver:
         style = rpr.find(qname(W_NS, "rStyle"))
         return style.get(qname(W_NS, "val")) if style is not None else None
 
+    def default_style_id(self, style_type: str) -> str | None:
+        """Return the OOXML ``w:default=1`` style for ``style_type``."""
+
+        return self.default_style_ids.get(style_type)
+
+    def style_chain(self, style_id: str | None) -> tuple[str, ...]:
+        """Return a cycle-bounded style chain in child-to-parent order."""
+
+        return tuple(style_id for style_id, _ in self._chain(style_id))
+
     def _chain(self, style_id: str | None) -> Iterable[tuple[str, dict[str, Any]]]:
         seen: set[str] = set()
         current = style_id
@@ -227,7 +271,21 @@ class StyleResolver:
             yield current, style["rpr"]
             current = style.get("based_on")
 
-    def _theme_value(self, token: str | None) -> str | None:
+    @staticmethod
+    def _script_from_language(language: Any) -> str | None:
+        if not isinstance(language, dict):
+            return None
+        value = language.get("eastAsia") or language.get("val")
+        if not isinstance(value, str):
+            return None
+        value = value.casefold()
+        if value.startswith(("zh-cn", "zh-sg", "zh-hans")):
+            return "Hans"
+        if value.startswith(("zh-tw", "zh-hk", "zh-mo", "zh-hant")):
+            return "Hant"
+        return None
+
+    def _theme_value(self, token: str | None, *, script: str | None = None) -> str | None:
         if token is None:
             return None
         normalized = token
@@ -244,6 +302,18 @@ class StyleResolver:
             "minorCs": "minorCs",
         }
         normalized = aliases.get(token, token)
+        if script and normalized in {"majorEastAsia", "minorEastAsia"}:
+            group = "major" if normalized.startswith("major") else "minor"
+            script_value = self.theme_script_fonts.get((group, script))
+            if script_value:
+                return script_value
+        if normalized in {"majorEastAsia", "minorEastAsia"} and script is None:
+            group = "major" if normalized.startswith("major") else "minor"
+            if any(group_name == group for group_name, _ in self.theme_script_fonts):
+                # A generic ``a:ea`` face is not a safe substitute when the
+                # theme explicitly supplies script-specific Hans/Hant faces
+                # and the run carries no language evidence.
+                return None
         return self.theme_fonts.get(normalized)
 
     def resolve_run(
@@ -258,7 +328,9 @@ class StyleResolver:
         effective: dict[str, Any] = {key: None for key in _FORMAT_KEYS}
         effective["font"] = {attribute: None for attribute in _FONT_ATTRIBUTES}
         effective["font"]["theme"] = {}
+        effective["font"]["theme_evidence"] = {}
         effective["raw"] = deepcopy(direct)
+        script_hint: str | None = self._script_from_language(direct.get("lang"))
 
         def take(key: str, value: Any, source: str) -> None:
             if value is None:
@@ -278,36 +350,98 @@ class StyleResolver:
                         effective["font"][attribute] = value
                         sources["font"][attribute] = source
                     elif theme_token is not None:
-                        effective["font"][attribute] = self._theme_value(theme_token)
+                        resolved_theme = self._theme_value(theme_token, script=script_hint)
+                        # A theme token is an explicit value in the cascade,
+                        # even when the available theme data cannot resolve it
+                        # without a script hint.  Keep an internal occupied
+                        # sentinel so a lower ordinary font cannot fill the
+                        # unresolved slot.  The sentinel is converted to
+                        # ``None`` before the result leaves this method.
+                        effective["font"][attribute] = (
+                            resolved_theme if resolved_theme is not None else _UNRESOLVED_THEME
+                        )
                         effective["font"]["theme"][attribute] = theme_token
-                        sources["font"][attribute] = "theme" if self._theme_value(theme_token) else source
+                        group = "major" if theme_token.casefold().startswith("major") else "minor" if theme_token.casefold().startswith("minor") else None
+                        available_scripts = sorted(
+                            script_name
+                            for (group_name, script_name), _font in self.theme_script_fonts.items()
+                            if group_name == group
+                        )
+                        effective["font"]["theme_evidence"][attribute] = {
+                            "token": theme_token,
+                            "resolved": resolved_theme is not None,
+                            "script": script_hint,
+                            "available_scripts": available_scripts,
+                        }
+                        sources["font"][attribute] = "theme" if resolved_theme else "unknown"
 
         take_font(direct.get("font"), "direct")
         for key in _FORMAT_KEYS:
             if key != "font":
                 take(key, direct.get(key), "direct")
-        for style_id, values in self._chain(character_style_id):
-            resolution_chain.append(f"character_style:{style_id}")
-            take_font(values.get("font"), "character_style")
+        for position, (style_id, values) in enumerate(self._chain(character_style_id)):
+            layer = f"character_style:{style_id}" if position == 0 else f"basedOn:{style_id}"
+            resolution_chain.append(layer)
+            if script_hint is None:
+                script_hint = self._script_from_language(values.get("lang"))
+            take_font(values.get("font"), layer)
             for key in _FORMAT_KEYS:
                 if key != "font":
-                    take(key, values.get(key), "character_style")
-        for style_id, values in self._chain(paragraph_style_id):
-            resolution_chain.append(f"paragraph_style:{style_id}")
-            take_font(values.get("font"), "paragraph_style")
+                    take(key, values.get(key), layer)
+        for position, (style_id, values) in enumerate(self._chain(paragraph_style_id)):
+            layer = f"paragraph_style:{style_id}" if position == 0 else f"basedOn:{style_id}"
+            resolution_chain.append(layer)
+            if script_hint is None:
+                script_hint = self._script_from_language(values.get("lang"))
+            take_font(values.get("font"), layer)
             for key in _FORMAT_KEYS:
                 if key != "font":
-                    take(key, values.get(key), "paragraph_style")
+                    take(key, values.get(key), layer)
+        if character_style_id is None:
+            default_character_style_id = self.default_style_id("character")
+            for position, (style_id, values) in enumerate(self._chain(default_character_style_id)):
+                layer = f"default_character_style:{style_id}" if position == 0 else f"basedOn:{style_id}"
+                resolution_chain.append(layer)
+                if script_hint is None:
+                    script_hint = self._script_from_language(values.get("lang"))
+                take_font(values.get("font"), layer)
+                for key in _FORMAT_KEYS:
+                    if key != "font":
+                        take(key, values.get(key), layer)
+        if paragraph_style_id is None:
+            default_paragraph_style_id = self.default_style_id("paragraph")
+            for position, (style_id, values) in enumerate(self._chain(default_paragraph_style_id)):
+                layer = f"default_paragraph_style:{style_id}" if position == 0 else f"basedOn:{style_id}"
+                resolution_chain.append(layer)
+                if script_hint is None:
+                    script_hint = self._script_from_language(values.get("lang"))
+                take_font(values.get("font"), layer)
+                for key in _FORMAT_KEYS:
+                    if key != "font":
+                        take(key, values.get(key), layer)
         take_font(self.doc_defaults.get("font"), "docDefaults")
         resolution_chain.append("docDefaults")
         for key in _FORMAT_KEYS:
             if key != "font":
                 take(key, self.doc_defaults.get(key), "docDefaults")
         for attribute in _FONT_ATTRIBUTES:
-            if effective["font"].get(attribute) is None and effective["font"]["theme"].get(attribute):
-                effective["font"][attribute] = self._theme_value(effective["font"]["theme"][attribute])
+            if effective["font"].get(attribute) is _UNRESOLVED_THEME:
+                theme_token = effective["font"]["theme"].get(attribute)
+                resolved_theme = self._theme_value(theme_token, script=script_hint)
+                effective["font"][attribute] = resolved_theme
+                evidence = effective["font"]["theme_evidence"].get(attribute)
+                if isinstance(evidence, dict):
+                    evidence["resolved"] = resolved_theme is not None
+                    evidence["script"] = script_hint
+                if resolved_theme is not None:
+                    sources["font"][attribute] = "theme"
+            elif effective["font"].get(attribute) is None and effective["font"]["theme"].get(attribute):
+                effective["font"][attribute] = self._theme_value(
+                    effective["font"]["theme"][attribute], script=script_hint
+                )
         if not effective["font"]["theme"]:
             effective["font"].pop("theme", None)
+            effective["font"].pop("theme_evidence", None)
         # Keep the structured ``font`` object, but also expose flat aliases.
         # The aliases make the JSON pleasant for simple consumers (and avoid
         # forcing a linter to guess how a nested font object is named).
@@ -330,6 +464,8 @@ class StyleResolver:
     def effective_paragraph_rpr(self, paragraph_style_id: str | None) -> dict[str, Any]:
         """Expose paragraph-style rPr resolution for tests and callers."""
         result: dict[str, Any] = deepcopy(self.doc_defaults)
+        if paragraph_style_id is None:
+            paragraph_style_id = self.default_style_id("paragraph")
         for _, values in reversed(tuple(self._chain(paragraph_style_id))):
             result.update(deepcopy(values))
         return result
@@ -392,10 +528,12 @@ class StyleResolver:
 
         resolution_chain = ["direct"]
         apply(direct, "direct")
-        for position, (style_id, _rpr_values) in enumerate(self._chain(paragraph_style_id)):
+        effective_style_id = paragraph_style_id or self.default_style_id("paragraph")
+        for position, (style_id, _rpr_values) in enumerate(self._chain(effective_style_id)):
             style = self.styles.get(style_id, {})
             style_values = parse_ppr(style.get("ppr"))
-            layer = "paragraph_style:" + style_id if position == 0 else "basedOn:" + style_id
+            prefix = "paragraph_style" if paragraph_style_id is not None else "default_paragraph_style"
+            layer = prefix + ":" + style_id if position == 0 else "basedOn:" + style_id
             resolution_chain.append(layer)
             apply(style_values, layer)
         resolution_chain.append("docDefaults")

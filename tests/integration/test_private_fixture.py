@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from collections import Counter
 from pathlib import Path
@@ -48,6 +49,11 @@ def private_analysis_inspection(private_fixture: Path) -> dict:
     return inspection
 
 
+@pytest.fixture(scope="module")
+def private_audit(private_analysis_inspection: dict) -> dict:
+    return lint_inspection(private_analysis_inspection)
+
+
 def test_private_fixture_identity_and_structure(private_fixture, private_inspection):
     assert hashlib.sha256(private_fixture.read_bytes()).hexdigest() == EXPECTED_SHA256
     assert private_inspection["input"]["sha256"] == EXPECTED_SHA256
@@ -62,6 +68,26 @@ def test_private_fixture_identity_and_structure(private_fixture, private_inspect
     assert private_inspection["notes"]["footnotes"]["actual_count"] == 0
     assert private_inspection["fields"]["counts"]["TOC"] == 1
     assert private_inspection["fields"]["counts"]["PAGEREF"] == 50
+    core_properties = private_inspection["core_properties"]
+    assert set(core_properties) <= {"creator", "last_modified_by"}
+    assert all(set(value) == {"present", "sha256"} for value in core_properties.values())
+    serialized = json.dumps(private_inspection, ensure_ascii=False)
+    assert str(private_fixture.parent) not in serialized
+
+    preview_lengths: list[int] = []
+
+    def collect_previews(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key.endswith("preview") and isinstance(item, str):
+                    preview_lengths.append(len(item))
+                collect_previews(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect_previews(item)
+
+    collect_previews(private_inspection)
+    assert preview_lengths and max(preview_lengths) <= 80
 
 
 def test_private_fixture_classification_false_positive_defenses(private_inspection):
@@ -79,8 +105,8 @@ def test_private_fixture_classification_false_positive_defenses(private_inspecti
     )
 
 
-def test_private_fixture_required_audit_conclusions(private_analysis_inspection):
-    audit = lint_inspection(private_analysis_inspection)
+def test_private_fixture_required_audit_conclusions(private_audit):
+    audit = private_audit
     statuses_by_rule: dict[str, set[str]] = {}
     for finding in audit["findings"]:
         statuses_by_rule.setdefault(finding["rule_id"], set()).add(finding["status"])
@@ -102,7 +128,7 @@ def test_private_fixture_required_audit_conclusions(private_analysis_inspection)
     for rule_id in required_errors:
         assert "ERROR" in statuses_by_rule[rule_id]
 
-    assert "MANUAL_REVIEW" in statuses_by_rule["ER-MS-EQUATION-001"]
+    assert statuses_by_rule["ER-MS-EQUATION-001"] == {"PASS"}
     assert "MANUAL_REVIEW" in statuses_by_rule["ER-MS-FIGURE-002"]
     assert statuses_by_rule["ER-MS-FOOTNOTE-001"] == {"NOT_APPLICABLE"}
     assert statuses_by_rule["ER-MS-FOOTNOTE-002"] == {"NOT_APPLICABLE"}
@@ -111,8 +137,10 @@ def test_private_fixture_required_audit_conclusions(private_analysis_inspection)
     assert audit["capabilities"]["not_checked"]
 
 
-def test_private_toc_and_references_are_excluded_from_body_citations(private_analysis_inspection):
-    audit = lint_inspection(private_analysis_inspection)
+def test_private_toc_and_references_are_excluded_from_body_citations(
+    private_analysis_inspection, private_audit
+):
+    audit = private_audit
     body_citation_findings = [
         finding
         for finding in audit["findings"]
@@ -126,3 +154,130 @@ def test_private_toc_and_references_are_excluded_from_body_citations(private_ana
 
     assert all(not paragraph_by_id[item["target"]["id"]].get("in_toc") for item in body_citation_findings)
     assert all(item["target"].get("role") != "reference_entry" for item in body_citation_findings)
+
+
+def test_private_narrative_citations_do_not_trigger_general_errors(
+    private_analysis_inspection, private_audit
+):
+    cases = (
+        (
+            "Abis and Veldkamp (2022)",
+            "ER-CIT-EN-TWOAUTHORS-001",
+            "and",
+        ),
+        (
+            "何威风与刘启亮（2010）",
+            "ER-CIT-ZH-TWOAUTHORS-001",
+            "与",
+        ),
+    )
+    paragraphs = private_analysis_inspection["paragraphs"]
+    for literal, connector_rule, connector in cases:
+        paragraph_id = next(
+            paragraph["id"] for paragraph in paragraphs if literal in paragraph.get("text", "")
+        )
+        general = [
+            finding
+            for finding in private_audit["findings"]
+            if finding["rule_id"] in {"ER-CIT-GENERAL-001", "ER-CIT-GENERAL-002"}
+            and finding["target"].get("id") == paragraph_id
+        ]
+        assert general and all(finding["status"] == "PASS" for finding in general)
+        assert any(
+            candidate.get("kind") == "narrative"
+            and candidate.get("raw_preview") == literal
+            for finding in general
+            for candidate in finding["observed"].get("candidates", [])
+        )
+        connector_findings = [
+            finding
+            for finding in private_audit["findings"]
+            if finding["rule_id"] == connector_rule
+            and finding["target"].get("id") == paragraph_id
+            and finding["observed"].get("author_connector") == connector
+        ]
+        assert connector_findings
+        assert all(finding["status"] == "ERROR" for finding in connector_findings)
+
+
+def test_private_multi_source_separator_is_attached_to_the_exact_candidate(
+    private_analysis_inspection, private_audit
+):
+    literal = "(Dechow et al., 2011; Kothari et al., 2005)"
+    paragraph_id = next(
+        paragraph["id"]
+        for paragraph in private_analysis_inspection["paragraphs"]
+        if literal in paragraph.get("text", "")
+    )
+    findings = [
+        finding
+        for finding in private_audit["findings"]
+        if finding["rule_id"] == "ER-CIT-MULTI-AUTHORSOURCES-001"
+        and finding["target"].get("id") == paragraph_id
+    ]
+    assert findings
+    assert any(
+        finding["status"] == "ERROR" and finding["observed"].get("separator") == ";"
+        for finding in findings
+    )
+
+
+def test_private_reference_numbering_and_page_range_target_are_precise(
+    private_analysis_inspection, private_audit
+):
+    classification = classify_inspection(private_analysis_inspection)
+    reference_ids = {
+        item["source_id"]
+        for item in classification["items"]
+        if item["role"] == "reference_entry"
+    }
+    reference_paragraphs = [
+        paragraph
+        for paragraph in private_analysis_inspection["paragraphs"]
+        if paragraph["id"] in reference_ids
+    ]
+    assert len(reference_paragraphs) == 53
+    assert sum(bool(paragraph.get("numPr", {}).get("resolved")) for paragraph in reference_paragraphs) == 53
+
+    literal = "58(1-2): 3-27"
+    paragraph_id = next(
+        paragraph["id"]
+        for paragraph in reference_paragraphs
+        if literal in paragraph.get("text", "")
+    )
+    finding = next(
+        finding
+        for finding in private_audit["findings"]
+        if finding["rule_id"] == "ER-MS-REF-PAGERANGE-001"
+        and finding["target"].get("id") == paragraph_id
+    )
+    assert finding["status"] == "ERROR"
+    assert finding["observed"]["selected_span"] == "3-27"
+    assert finding["observed"]["selected_span"] != "1-2"
+
+
+def test_private_tables_feed_latin_font_and_note_binding_from_inspector(
+    private_analysis_inspection, private_audit
+):
+    table_findings = [
+        finding
+        for finding in private_audit["findings"]
+        if finding["rule_id"] == "ER-MS-LATIN-FONT-001"
+        and finding["target"].get("scope") == "table"
+    ]
+    table_ids = {
+        finding["target"].get("table_id", finding["target"].get("table_index"))
+        for finding in table_findings
+    }
+    assert len(table_ids) == 11
+    assert any(finding["status"] == "ERROR" for finding in table_findings)
+
+    candidates = [
+        candidate
+        for table in private_analysis_inspection["tables"]
+        for candidate in table.get("note_candidates", [])
+    ]
+    assert candidates
+    assert all(candidate["table_id"] and candidate["paragraph_id"] for candidate in candidates)
+    assert all(candidate["distance"] == 1 for candidate in candidates)
+    assert all(candidate["reason"] == "first_nonempty_post_table_note" for candidate in candidates)

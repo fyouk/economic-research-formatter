@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 import re
 from typing import Any
 
+from .citations import _footnote_items, _footnote_semantics
 from .common import RuleContext, finding, is_chinese_text, rule_severity, text_of
 
 
@@ -185,6 +186,47 @@ def _explicit_separator_evidence(entry: Mapping[str, Any]) -> list[Any]:
     return values
 
 
+def _unquoted_semicolon_positions(text: str) -> list[int]:
+    """Return semicolons outside paired title quotation marks."""
+
+    positions: list[int] = []
+    opening_quotes = {"\"", "'", "“", "‘", "「", "『"}
+    closing_quotes = {"\"", "'", "”", "’", "」", "』"}
+    quote_stack: list[str] = []
+    for index, character in enumerate(text):
+        if character in opening_quotes:
+            if character in {"\"", "'"} and quote_stack and quote_stack[-1] == character:
+                quote_stack.pop()
+            elif character in {"\"", "'"} and quote_stack:
+                continue
+            else:
+                quote_stack.append(character)
+        elif character in closing_quotes and quote_stack:
+            if character in {"”", "’", "」", "』"} or quote_stack[-1] == character:
+                quote_stack.pop()
+        elif character in {";", "；"} and not quote_stack:
+            positions.append(index)
+    return positions
+
+
+def _text_scan_proves_field_semicolons(text: str) -> bool:
+    """Recognise only the legacy high-confidence multi-field semicolon shape.
+
+    A single semicolon is intentionally never enough: without parsed field
+    boundaries it may belong to an article title.  Two or more unquoted
+    semicolons bracketing the publication year are the narrower legacy shape
+    retained for backwards-compatible diagnostics.
+    """
+
+    positions = _unquoted_semicolon_positions(text)
+    if len(positions) < 2:
+        return False
+    year = re.search(r"(?:19|20)\d{2}", text)
+    if year is None:
+        return False
+    return positions[0] < year.start() < positions[1]
+
+
 def _foreign_separator_parse(entry: Mapping[str, Any], expected: Any) -> tuple[str, dict[str, Any]]:
     expected_values = _expected_separator_values(expected)
     explicit = _explicit_separator_evidence(entry)
@@ -203,15 +245,17 @@ def _foreign_separator_parse(entry: Mapping[str, Any], expected: Any) -> tuple[s
         "actual_separator": actual_values[0] if actual_values else None,
         "separator_evidence": "inspector_boundaries" if explicit else "text_scan",
     }
-    if any(value in {";", "；"} for value in actual_values):
-        return "wrong", observed
     if explicit:
+        if any(value in {";", "；"} for value in actual_values):
+            return "wrong", observed
         if actual_values and all(value in expected_values for value in actual_values):
             return "ok", observed
         return "wrong", observed
     # A comma in prose is not enough to prove field boundaries (author names,
     # initials, and titles can contain commas).  Without Inspector boundary
     # evidence the safe result is manual review.
+    if any(value in {";", "；"} for value in actual_values) and _text_scan_proves_field_semicolons(text):
+        return "wrong", observed
     if text_separators:
         return "uncertain", observed
     return "uncertain", observed
@@ -265,7 +309,40 @@ def _content_footnote(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[st
         count = 0
     if count <= 0:
         return _none(rule, ctx, "文档没有实际脚注。")
-    return [finding(rule, "MANUAL_REVIEW", "脚注中的文献引文需复用文内引文规则并人工确认。", target=ctx.document_target, observed={"actual_footnote_count": count}, confidence=0.60)]
+    notes = _footnote_items(ctx)
+    if not notes:
+        return [finding(rule, "MANUAL_REVIEW", "文档存在实际脚注，但 Inspector 未提供可判断语义的脚注段落证据。", target=ctx.document_target, observed={"actual_footnote_count": count}, confidence=0.40)]
+    results: list[dict[str, Any]] = []
+    for note in notes:
+        semantics, candidates = _footnote_semantics(note)
+        observed = {
+            "footnote_semantics": semantics,
+            "candidates": [candidate.to_dict() for candidate in candidates],
+            "footnote_paragraph_ids": [paragraph.get("id") for paragraph in note["paragraphs"]],
+        }
+        if semantics == "content_note_with_inline_citation":
+            results.append(
+                finding(
+                    rule,
+                    "PASS",
+                    "内容注释中的文献已采用文内作者-年份引文形式。",
+                    paragraph=note["target"],
+                    observed=observed,
+                    confidence=0.92,
+                )
+            )
+        elif semantics == "ambiguous_literature":
+            results.append(
+                finding(
+                    rule,
+                    "MANUAL_REVIEW",
+                    "内容注释中的疑似文献引文缺少足够的结构化证据。",
+                    paragraph=note["target"],
+                    observed=observed,
+                    confidence=0.55,
+                )
+            )
+    return results or _none(rule, ctx, "未识别到内容注释中的文献引文。")
 
 
 def _unsupported(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, Any]]:

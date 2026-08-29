@@ -1,0 +1,56 @@
+version: 1
+rule_schema:
+  required_fields:
+    - id
+    - domain
+    - target
+    - normativity
+    - source
+    - requirement
+    - lint
+    - autofix
+
+  enums:
+    domain:
+      - manuscript
+      - citation
+      - reference
+    normativity:
+      - mandatory
+      - recommended
+      - example_only
+    source_type:
+      - red_annotation
+      - explicit_instruction
+      - operational_summary
+      - example
+    lint_severity:
+      - error
+      - warning
+      - info
+      - manual_review
+    autofix:
+      - safe
+      - conditional
+      - never
+  statuses:
+    conflict:
+      - unresolved_overlap
+      - unresolved
+      - source_example_vs_explicit_annotation
+    unresolved:
+      - not_specified_in_current_sources
+      - example_present_but_red_annotation_not_explicit
+
+  conventions:
+    rule_id: "ER-{MS|CIT|REF}-{TOPIC}-{NNN}"
+    source_locator: "Use stable section/annotation description; do not depend only on line numbers."
+    evidence: "Keep a short exact source-supported phrase; never invent missing requirements."
+
+  semantics:
+    mandatory: "来源使用明确命令/要求，或红色批注给出确定性格式。"
+    recommended: "来源使用‘建议’等非强制措辞。"
+    example_only: "仅从示例观察到，来源没有明确宣布为规则。"
+    autofix_safe: "结构识别确定后，修改的目标属性明确且低风险。"
+    autofix_conditional: "只有在语义角色或对象边界达到规定置信度时执行。"
+    autofix_never: "只检查/报告，不自动改。"

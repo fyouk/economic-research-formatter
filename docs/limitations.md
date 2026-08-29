@@ -22,6 +22,8 @@ Classifier 是确定性 heuristic，不使用外部 LLM API。它输出置信度
 
 Citation v1 只对高置信度表层模式执行检查，并排除 TOC、公式和参考文献区。它不是完整的引文解析器，也不做 Crossref/DOI 元数据核对。
 
+已支持 parenthetical/narrative 作者-年份候选与高置信度脚注引文识别；但涉及不规则作者名、机构作者、复杂页码或嵌套语义时仍可能需要人工复核。
+
 外文文章标题、期刊名和出版社边界无法稳定解析时，相关规则输出 `MANUAL_REVIEW`，不伪装为已检查。
 
 ## 公式、图像与安全对象
@@ -32,10 +34,12 @@ Citation v1 只对高置信度表层模式执行检查，并排除 TOC、公式�
 - Comments、tracked changes 和 embedded objects 当前主要记录主文档 OOXML 证据。
 - Header/footer 关系按 section 报告，其内部段落不混入 body inventory。
 
+Latin-font v1 检查 body paragraph、table cell paragraph 和 footnote paragraph。Header/footer 内部文本、text box/drawing text 和 embedded chart 尚未进入字符级字体审计。
+
 ## 规则范围
 
 `unresolved.yaml` 中未规定的页边距、正文行距、正文中文字体字号等项目是 `NOT_CHECKED`，不会产生伪 `ERROR`。未裁决的 `ER-CONFLICT-001` 和 `ER-CONFLICT-002` 是 `MANUAL_REVIEW`，不会被静默自动决定。
 
 ## 分发方式
 
-当前运行时从仓库顶层的 `rules/` 和 `sources/normalized/` 读取权威数据，因此支持的安装方式是在完整仓库 checkout 内执行 editable install。当前生成的独立 wheel 不包含仓库顶层规则资料，尚不是可脱离仓库运行的发行包。
+wheel 内置规则 profile 并通过 `importlib.resources` 加载，可脱离仓库 checkout 运行。仓库顶层规则树与 package profile 之间依靠逐字节同步测试；修改规则时必须同步两份，否则 CI 失败。

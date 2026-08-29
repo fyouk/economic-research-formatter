@@ -66,6 +66,42 @@ def test_inspect_cli_only_writes_full_text_when_explicitly_requested(tmp_path):
     assert len(long_paragraph["text_preview"]) == 80
 
 
+def test_core_metadata_requires_a_separate_explicit_cli_opt_in(tmp_path):
+    input_path = _minimal_docx(tmp_path / "metadata.docx")
+    document = Document(input_path)
+    document.core_properties.author = "Private Creator"
+    document.core_properties.last_modified_by = "Private Modifier"
+    document.core_properties.title = "Private Title"
+    document.save(input_path)
+
+    compact = tmp_path / "compact.json"
+    text_only = tmp_path / "text-only.json"
+    expanded = tmp_path / "metadata.json"
+    assert main(["inspect", str(input_path), "--output", str(compact)]) == 0
+    assert main(
+        ["inspect", str(input_path), "--output", str(text_only), "--include-text"]
+    ) == 0
+    assert main(
+        [
+            "inspect",
+            str(input_path),
+            "--output",
+            str(expanded),
+            "--include-metadata",
+        ]
+    ) == 0
+
+    for output in (compact, text_only):
+        core = json.loads(output.read_text(encoding="utf-8"))["core_properties"]
+        assert core["creator"]["present"] is True
+        assert "Private Creator" not in json.dumps(core)
+        assert "title" not in core
+    expanded_core = json.loads(expanded.read_text(encoding="utf-8"))["core_properties"]
+    assert expanded_core["creator"] == "Private Creator"
+    assert expanded_core["last_modified_by"] == "Private Modifier"
+    assert expanded_core["title"] == "Private Title"
+
+
 def test_lint_cli_writes_all_reports_and_exit_zero_override(tmp_path):
     input_path = _minimal_docx(tmp_path / "paper.docx")
     output_dir = tmp_path / "audit"

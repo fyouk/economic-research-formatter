@@ -32,3 +32,13 @@ er-format lint "$ER_PRIVATE_FIXTURE" \
 - 提交前使用 `git status --short`、`git diff --cached --name-status` 和 Git history 搜索再次确认。
 
 Inspector 和 Linter 均只读输入 DOCX。集成测试还会比较执行前后的 bytes 与 `mtime_ns`。
+
+私有集成验收还会核对：
+
+- narrative citation 不被 GENERAL 规则误报，连接词规则仍独立生效；
+- 多来源 ASCII 分号定位到实际候选段落；
+- 53 个参考文献条目和 53 个可解析自动编号；
+- 页码范围 finding 选中真实 pages span，不把括号内卷期范围当页码；
+- 11 张表的 cell paragraph 进入 Latin-font 检查；
+- 表注绑定 evidence 由 Inspector `body_blocks`/相邻关系产生；
+- compact report 不包含核心属性明文、绝对路径或超过 80 字的 preview。

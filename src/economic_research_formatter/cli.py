@@ -106,6 +106,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Include full document text in inspection JSON (privacy-sensitive)",
     )
+    inspect_parser.add_argument(
+        "--include-metadata",
+        action="store_true",
+        help="Include plaintext Word core properties (privacy-sensitive)",
+    )
     inspect_parser.add_argument("--debug", action="store_true", help=argparse.SUPPRESS)
 
     lint_parser = sub.add_parser("lint", help="Inspect and lint a DOCX without modifying it")
@@ -115,6 +120,11 @@ def main(argv: list[str] | None = None) -> int:
         "--include-text",
         action="store_true",
         help="Include full document text in inspection.json (privacy-sensitive)",
+    )
+    lint_parser.add_argument(
+        "--include-metadata",
+        action="store_true",
+        help="Include plaintext Word core properties in inspection.json",
     )
     lint_parser.add_argument(
         "--exit-zero", action="store_true", help="Return zero even when ERROR findings exist"
@@ -144,7 +154,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "inspect":
             _ensure_not_input_alias(args.input, args.output)
-            inspection = inspect_docx(args.input, include_text=args.include_text)
+            inspection = inspect_docx(
+                args.input,
+                include_text=args.include_text,
+                include_metadata=args.include_metadata,
+            )
             _write_json(inspection, args.output, protected_input=args.input)
             return 0
 
@@ -152,7 +166,11 @@ def main(argv: list[str] | None = None) -> int:
             # Linting needs full paragraph text for high-confidence citation
             # candidates.  It remains in memory unless the user explicitly
             # opts in to full text in inspection.json.
-            analysis_inspection = inspect_docx(args.input, include_text=True)
+            analysis_inspection = inspect_docx(
+                args.input,
+                include_text=True,
+                include_metadata=args.include_metadata,
+            )
             audit = lint_inspection(analysis_inspection)
             persisted_inspection = (
                 analysis_inspection

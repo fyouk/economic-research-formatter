@@ -7,6 +7,7 @@ does not encode a second set of manuscript-format requirements.
 
 from __future__ import annotations
 
+from importlib import resources
 import re
 from pathlib import Path
 from typing import Any, Iterable
@@ -85,10 +86,18 @@ SCHEMA_ENUM_FIELDS = frozenset(
 )
 SCHEMA_STATUS_FIELDS = frozenset({"conflict", "unresolved"})
 UNRESOLVED_CONFLICT_STATUSES = frozenset({"unresolved", "unresolved_overlap"})
+PROFILE_PACKAGE = "economic_research_formatter.profiles.economic_research"
 
 
 def project_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+    """Return the installed Economic Research profile root.
+
+    The profile is bundled as package data so console commands work outside a
+    repository checkout.  Repository-level rule files remain the maintained
+    source tree and are guarded by a byte-for-byte synchronization test.
+    """
+
+    return Path(str(resources.files(PROFILE_PACKAGE)))
 
 
 def load_yaml(path: Path) -> dict[str, Any]:
@@ -193,6 +202,9 @@ class _ValidationContext:
 
     def file_path(self, filename: str) -> Path:
         if filename == SOURCE_INDEX_FILE:
+            bundled = self.root / "sources" / filename
+            if bundled.exists():
+                return bundled
             return self.root / "sources" / "normalized" / filename
         return self.root / "rules" / filename
 

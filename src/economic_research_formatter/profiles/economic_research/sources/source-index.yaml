@@ -1,0 +1,22 @@
+version: 1
+sources:
+  - id: ER-MS-IMG-NOTES
+    path: sources/raw/经济研究_稿件体例要求_整理版.md
+    medium: markdown
+    provenance: user_provided
+    description: 三张示例图片整理稿，包含操作性整理、红色批注逐条校核稿以及“未明确规定项目”。
+    special_handling:
+      preserve_red_annotation_semantics: true
+      do_not_silently_correct_examples: true
+
+  - id: ER-MS-DOCX
+    path: sources/raw/经济研究_稿件体例要求_整理版.docx
+    medium: docx
+    provenance: user_provided
+    description: 稿件体例要求的 Word 整理版，当前主要作为结构/渲染参考样本。
+
+  - id: ER-REF-GUIDE
+    path: sources/raw/参考文献索引及用录体例说明.md
+    medium: markdown
+    provenance: user_provided
+    description: 文内文献索引与注释、译文/外文引用、文后参考文献编排、其他脚注中的文献引用规则。

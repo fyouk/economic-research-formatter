@@ -28,7 +28,6 @@ from .common import (
     rule_severity,
     text_has_latin_or_digit,
     text_of,
-    value_from,
     run_value,
 )
 
@@ -170,27 +169,181 @@ def _title_marker(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, A
     requirement = expected_for(rule)
     marker = str(requirement.get("marker", ""))
     mechanism = str(requirement.get("mechanism", ""))
-    found = False
     observed: dict[str, Any] = {"marker": marker, "mechanism": mechanism}
+    marker_evidence: list[dict[str, Any]] = []
+    has_author_target = bool(ctx.classified("author_name", "author_information"))
     for paragraph in titles:
-        text = text_of(paragraph)
         references = _title_footnote_reference_evidence(ctx, paragraph)
-        marker_in_text = marker and marker in text
-        has_reference = bool(references) or bool(paragraph.get("has_footnote_reference"))
-        if has_reference and (not mechanism or mechanism.casefold() == "footnote"):
-            # A reliable OOXML reference establishes the mechanism even when
-            # the marker glyph itself is hidden in a field/run representation.
-            found = True
-        elif marker_in_text and (not mechanism or paragraph.get("footnote_reference") is not None):
-            found = True
+        has_author_target = has_author_target or bool(references) or bool(paragraph.get("has_footnote_reference"))
+        for reference in references or ([{"kind": "footnote", "marker": "unknown"}] if paragraph.get("has_footnote_reference") else []):
+            marker_evidence.append(_classify_title_marker_reference(reference, marker))
         if references:
             observed.setdefault("footnote_reference_evidence", []).extend(references)
         observed.setdefault("title_ids", []).append(paragraph.get("id"))
-    if found:
-        return [finding(rule, "PASS", "题名作者信息标记已识别。", paragraph=titles[0], observed=observed)]
+    # A title without any author-information target is not enough evidence to
+    # assert a missing marker.  In particular, do not infer an author from
+    # abstract/body prose merely because a title exists.
+    if not has_author_target:
+        return [
+            finding(
+                rule,
+                "NOT_APPLICABLE",
+                "未识别到题名作者信息目标，无法检查脚注标记。",
+                paragraph=titles[0],
+                observed=observed,
+            )
+        ]
+    if marker_evidence:
+        observed["marker_evidence"] = marker_evidence
+        if any(item["status"] == "wrong" for item in marker_evidence):
+            return [finding(rule, rule_severity(rule), "题名作者信息脚注使用了非要求的标记。", paragraph=titles[0], observed=observed)]
+        if any(item["status"] == "unknown" for item in marker_evidence):
+            return [finding(rule, "MANUAL_REVIEW", "题名存在脚注引用，但无法证明其显示标记为要求的自定义星号。", paragraph=titles[0], observed=observed)]
+        return [finding(rule, "PASS", "题名作者信息脚注已证明使用要求的自定义星号标记。", paragraph=titles[0], observed=observed)]
     # This rule checks a required marker; its absence is a reportable error, but
     # remains read-only and never inserts a footnote.
+    observed["marker_evidence"] = []
     return [finding(rule, rule_severity(rule), "题名未检测到要求的作者信息脚注标记。", paragraph=titles[0], observed=observed)]
+
+
+def _as_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    text = str(value).strip().casefold()
+    if text in {"1", "true", "yes", "y", "是"}:
+        return True
+    if text in {"0", "false", "no", "n", "否"}:
+        return False
+    return None
+
+
+def _classify_title_marker_reference(reference: Any, expected_marker: str) -> dict[str, Any]:
+    """Classify Inspector marker evidence without guessing hidden glyphs.
+
+    ``w:footnoteReference`` is the OOXML element name, not the displayed
+    marker.  It therefore cannot by itself establish compliance.  A literal
+    marker is accepted only when the Inspector associates it with this
+    reference; otherwise the result remains ``unknown``.
+    """
+
+    if not isinstance(reference, Mapping):
+        return {"status": "unknown", "reason": "reference_without_marker_metadata", "reference": reference}
+    explicit_values: list[tuple[str, Any]] = []
+    for key in (
+        "display_marker",
+        "literal_marker",
+        "marker_glyph",
+        "marker_text",
+        "custom_marker",
+        "customMark",
+        "symbol",
+    ):
+        if reference.get(key) is not None:
+            explicit_values.append((key, reference.get(key)))
+    marker_value = reference.get("marker")
+    if marker_value is not None and str(marker_value) not in {"footnoteReference", "endnoteReference"}:
+        explicit_values.append(("marker", marker_value))
+    value = next(((key, str(raw).strip()) for key, raw in explicit_values if str(raw).strip()), None)
+    custom = next(
+        (
+            _as_bool(reference.get(key))
+            for key in ("custom_mark", "customMark", "custom_mark_follows", "customMarkFollows", "is_custom_mark")
+            if _as_bool(reference.get(key)) is not None
+        ),
+        None,
+    )
+    automatic = next(
+        (
+            _as_bool(reference.get(key))
+            for key in ("automatic", "automatic_numbered", "numbered", "is_numbered")
+            if _as_bool(reference.get(key)) is not None
+        ),
+        None,
+    )
+    result: dict[str, Any] = {
+        "id": reference.get("id", reference.get("reference_id")),
+        "kind": reference.get("kind", "footnote"),
+        "status": "unknown",
+        "reason": "marker_not_exposed",
+    }
+    if value is not None:
+        key, glyph = value
+        result["marker"] = glyph
+        result["marker_source"] = key
+        if glyph == expected_marker and (custom is not False or key in {"literal_marker", "marker_glyph", "marker"}):
+            result.update(status="pass", reason="associated_custom_marker")
+            return result
+        result.update(status="wrong", reason="associated_nonmatching_marker")
+        return result
+    if automatic is True:
+        result.update(status="wrong", reason="automatic_numbered_marker")
+    elif custom is not None:
+        result["custom_mark_follows"] = custom
+        result["reason"] = "custom_marker_without_literal_glyph"
+    return result
+
+
+def _reference_id(value: Any) -> str | None:
+    if isinstance(value, Mapping):
+        for key in ("id", "reference_id", "note_id"):
+            identifier = value.get(key)
+            if identifier is not None and str(identifier).strip():
+                return str(identifier).strip()
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+        return value.strip()
+    return None
+
+
+def _reference_kind(value: Any) -> str:
+    if isinstance(value, Mapping):
+        return str(value.get("kind", "footnote")).casefold()
+    return "footnote"
+
+
+def _merge_reference_values(values: Sequence[Any]) -> list[Any]:
+    """Merge aliases and detailed note evidence by reference ID.
+
+    Inspector intentionally exposes a compact ID list alongside detailed
+    evidence.  The ID list proves existence only; once a structured record for
+    the same reference arrives, it is the sole marker evidence used by the
+    title-marker rule.
+    """
+
+    merged: dict[str, Any] = {}
+    unkeyed: list[Any] = []
+    unkeyed_seen: set[str] = set()
+    for value in values:
+        if _reference_kind(value) != "footnote":
+            continue
+        identifier = _reference_id(value)
+        if identifier is None:
+            marker = repr(value)
+            if marker not in unkeyed_seen:
+                unkeyed_seen.add(marker)
+                unkeyed.append(value)
+            continue
+        if isinstance(value, Mapping):
+            incoming = dict(value)
+            existing = merged.get(identifier)
+            if isinstance(existing, Mapping):
+                combined = dict(existing)
+                combined.update({key: item for key, item in incoming.items() if item is not None})
+                merged[identifier] = combined
+            elif existing is None:
+                merged[identifier] = incoming
+            # A naked ID already present is replaced by structured evidence.
+            else:
+                merged[identifier] = incoming
+        elif identifier not in merged:
+            merged[identifier] = {"id": value}
+    return [*merged.values(), *unkeyed]
 
 
 def _title_footnote_reference_evidence(ctx: RuleContext, paragraph: Mapping[str, Any]) -> list[Any]:
@@ -249,15 +402,7 @@ def _title_footnote_reference_evidence(ctx: RuleContext, paragraph: Mapping[str,
             bound_id = item.get("paragraph_id") or item.get("title_id") or item.get("target_id")
             if bound_id is not None and str(bound_id) == paragraph_id:
                 values.append(dict(item))
-    deduplicated: list[Any] = []
-    seen: set[str] = set()
-    for value in values:
-        marker = repr(value)
-        if marker in seen:
-            continue
-        seen.add(marker)
-        deduplicated.append(value)
-    return deduplicated
+    return _merge_reference_values(values)
 
 
 def _authorinfo_term(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, Any]]:
@@ -265,22 +410,109 @@ def _authorinfo_term(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str
     preferred = str(requirement.get("preferred_term", ""))
     disallowed = str(requirement.get("disallowed_term", ""))
     targets = ctx.classified("author_information")
-    matches = [paragraph for paragraph in targets if disallowed and disallowed in text_of(paragraph)]
-    if matches:
+    term_locations: list[tuple[Mapping[str, Any], list[dict[str, Any]], list[dict[str, Any]]]] = []
+    for paragraph in targets:
+        text = text_of(paragraph)
+        locations: list[dict[str, Any]] = []
+        for term in (preferred, disallowed):
+            if not term:
+                continue
+            start = 0
+            while True:
+                index = text.find(term, start)
+                if index < 0:
+                    break
+                locations.append(
+                    {
+                        "term": term,
+                        "span": [index, index + len(term)],
+                        "text_preview": text[max(0, index - 20) : index + len(term) + 20],
+                    }
+                )
+                start = index + max(1, len(term))
+        locations.sort(key=lambda item: (item["span"][0], item["term"]))
+        disallowed_locations = [item for item in locations if item["term"] == disallowed]
+        if locations:
+            for item in locations:
+                item["paragraph_id"] = paragraph.get("id")
+        term_locations.append((paragraph, locations, disallowed_locations))
+    bad = [item for item in term_locations if item[2]]
+    if bad:
         return [
             finding(
                 rule,
                 rule_severity(rule),
                 f"作者信息中使用了不推荐术语“{disallowed}”，应使用“{preferred}”。",
                 paragraph=paragraph,
-                observed={"term": disallowed},
+                observed={"term": disallowed, "locations": locations},
             )
-            for paragraph in matches
+            for paragraph, locations, _ in bad
         ]
+    preferred_observed = [item for _, locations, _ in term_locations for item in locations if item["term"] == preferred]
+    if preferred_observed:
+        preferred_paragraph = next(
+            paragraph
+            for paragraph, locations, _ in term_locations
+            if any(item["term"] == preferred for item in locations)
+        )
+        return [
+            finding(
+                rule,
+                "PASS",
+                f"作者信息术语符合“{preferred}”要求。",
+                paragraph=preferred_paragraph,
+                observed={"term": preferred, "locations": preferred_observed},
+            )
+        ]
+    # An author-information role without either spelling is not evidence that
+    # the preferred term was used.  Keep the result explicitly non-applicable.
     if targets:
-        return [finding(rule, "PASS", f"作者信息术语符合“{preferred}”要求。", paragraph=targets[0], observed={"term": preferred})]
-    # A missing contact block is not evidence of a wrong term.
+        return [
+            finding(
+                rule,
+                "NOT_APPLICABLE",
+                "已识别作者信息段，但未观察到“电子信箱”或“电子邮箱”术语。",
+                paragraph=targets[0],
+                observed={"term": None, "locations": []},
+            )
+        ]
     return [finding(rule, "NOT_APPLICABLE", "未识别到作者联系信息段。", target=ctx.document_target)]
+
+
+def _heading_has_independent_level_evidence(paragraph: Mapping[str, Any]) -> bool:
+    classification = paragraph.get("_classification")
+    evidence = classification.get("evidence", []) if isinstance(classification, Mapping) else []
+    if isinstance(evidence, Sequence) and not isinstance(evidence, (str, bytes)):
+        if any(
+            str(token).startswith("structural_level=")
+            for token in evidence
+        ):
+            return True
+    # Keep this adapter tolerant of older classification envelopes when raw
+    # Inspector structure is still present on the paragraph.
+    style = str(paragraph.get("style_name") or paragraph.get("effective_style_name") or "").casefold()
+    if re.search(r"(?:heading|标题)[-_ ]*[2-4]\b", style):
+        return True
+    if paragraph.get("outline_level") is not None:
+        return True
+    numbering = paragraph.get("numbering") or paragraph.get("numPr")
+    return isinstance(numbering, Mapping) and any(
+        numbering.get(key) is not None for key in ("ilvl", "level", "outline_level")
+    )
+
+
+def _visible_only_level_jump(targets: Sequence[Mapping[str, Any]], ctx: RuleContext) -> bool:
+    """Return whether visible markers leave a non-adjacent hierarchy jump."""
+
+    if not targets or any(_heading_has_independent_level_evidence(item) for item in targets):
+        return False
+    levels: list[int] = []
+    for paragraph in targets:
+        role = ctx.role(paragraph)
+        suffix = role.rsplit("_", 1)[-1]
+        if suffix.isdigit():
+            levels.append(int(suffix))
+    return any(abs(current - previous) > 1 for previous, current in zip(levels, levels[1:]))
 
 
 def _hierarchy(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, Any]]:
@@ -292,32 +524,76 @@ def _hierarchy(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, Any]
     level_2_req = level_2_req if isinstance(level_2_req, Mapping) else {}
     lower_req = requirement.get("lower_levels", {})
     lower_req = lower_req if isinstance(lower_req, Mapping) else {}
-    expected_prefix = str(level_2_req.get("prefix_pattern", ""))
+    expected_by_level: dict[int, dict[str, Any]] = {
+        2: {
+            "prefix": str(level_2_req.get("prefix_pattern", "")),
+            "leading_spaces_cn": level_2_req.get("leading_spaces_cn", 2),
+        },
+        3: {"prefix": str(lower_req.get("level_3_prefix", "1."))},
+        4: {"prefix": str(lower_req.get("level_4_prefix", "（1）"))},
+    }
     lower_sequence = lower_req.get("sequence", [])
-    if not isinstance(lower_sequence, Sequence) or isinstance(lower_sequence, (str, bytes)):
-        lower_sequence = []
+    if isinstance(lower_sequence, Sequence) and not isinstance(lower_sequence, (str, bytes)):
+        if len(lower_sequence) > 0 and not lower_req.get("level_3_prefix"):
+            expected_by_level[3]["prefix"] = str(lower_sequence[0])
+        if len(lower_sequence) > 1 and not lower_req.get("level_4_prefix"):
+            expected_by_level[4]["prefix"] = str(lower_sequence[1])
 
     bad: list[dict[str, Any]] = []
     observed_levels: list[dict[str, Any]] = []
     for paragraph in targets:
         role = ctx.role(paragraph)
         level = int(role.rsplit("_", 1)[-1]) if role.rsplit("_", 1)[-1].isdigit() else None
-        text = text_of(paragraph).lstrip(" \u3000")
-        observed_levels.append({"id": paragraph.get("id"), "level": level, "text_preview": text[:80]})
+        text = text_of(paragraph)
+        leading_chars: list[str] = []
+        for character in text:
+            if character not in {" ", "\u3000"}:
+                break
+            leading_chars.append(character)
+        text_without_leading = text[len(leading_chars) :]
+        heading_observed = {
+            "id": paragraph.get("id"),
+            "level": level,
+            "text_preview": text[:80],
+            "leading_space_count": len(leading_chars),
+            "leading_space_codepoints": [f"U+{ord(character):04X}" for character in leading_chars],
+            "leading_space_policy": "exactly two U+0020 characters; U+3000 is not silently treated as two U+0020 characters",
+            "prefix_observed": text_without_leading[:20],
+        }
+        observed_levels.append(heading_observed)
         valid = True
-        if level == 2 and expected_prefix:
-            # Requirement values are literal examples in the current YAML.  If
-            # a future rule supplies a real regexp, support that too.
-            try:
-                valid = bool(re.match(expected_prefix, text))
-            except re.error:
-                valid = text.startswith(expected_prefix)
-            if not valid:
-                valid = text.startswith(expected_prefix)
-        elif level in {3, 4} and lower_sequence:
-            valid = any(text.startswith(str(prefix)) for prefix in lower_sequence)
+        expected = expected_by_level.get(level or -1, {})
+        expected_prefix = str(expected.get("prefix", ""))
+        if level == 2:
+            valid = len(leading_chars) == int(expected.get("leading_spaces_cn", 2)) and all(
+                character == " " for character in leading_chars
+            )
+            if expected_prefix:
+                valid = valid and text_without_leading.startswith(expected_prefix)
+        elif level in {3, 4} and expected_prefix:
+            valid = text_without_leading.startswith(expected_prefix)
         if not valid:
-            bad.append({"id": paragraph.get("id"), "level": level, "text_preview": text[:80]})
+            violation = dict(heading_observed)
+            violation["expected"] = expected
+            bad.append(violation)
+    if _visible_only_level_jump(targets, ctx):
+        first = targets[0]
+        return [
+            finding(
+                rule,
+                "MANUAL_REVIEW",
+                "仅检测到可见标题前缀，且层级发生跳级；无法可靠确定其真实层级，当前需人工复核。",
+                paragraph=first,
+                target=paragraph_target(first, ctx.role(first)),
+                observed={
+                    "headings": observed_levels,
+                    "hierarchy_evidence": "visible_prefix_only",
+                    "ambiguous_level_jump": True,
+                    "leading_space_policy": "exactly two U+0020 characters; U+3000 is not silently treated as two U+0020 characters",
+                },
+                confidence=0.50,
+            )
+        ]
     if bad:
         first_bad = next((paragraph for paragraph in targets if paragraph.get("id") == bad[0].get("id")), targets[0])
         return [
@@ -327,7 +603,12 @@ def _hierarchy(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, Any]
                 "标题编号层级不符合来源规则；检测到论文式层级编号。",
                 paragraph=first_bad,
                 target=paragraph_target(first_bad, ctx.role(first_bad)),
-                observed={"headings": observed_levels, "violations": bad, "style": "thesis-style numbering"},
+                observed={
+                    "headings": observed_levels,
+                    "violations": bad,
+                    "style": "thesis-style numbering",
+                    "leading_space_policy": "exactly two U+0020 characters; U+3000 is not silently treated as two U+0020 characters",
+                },
             )
             for item in bad[:1]
         ]
@@ -336,37 +617,123 @@ def _hierarchy(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, Any]
 
 def _equation(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, Any]]:
     info = equation_info(ctx.inspection)
-    count = info.get("omath_count", info.get("count", 0))
-    try:
-        count = int(count or 0)
-    except (TypeError, ValueError):
-        count = 0
-    if count <= 0 and not ctx.classified("equation"):
-        return [finding(rule, "NOT_APPLICABLE", "文档中未检测到 Word OMML 公式。", target=ctx.document_target)]
-    ids = info.get("paragraph_ids", [])
-    ids = ids if isinstance(ids, Sequence) and not isinstance(ids, (str, bytes)) else []
-    targets = [p for p in ctx.paragraph_list if p.get("id") in ids]
-    if targets:
-        return [
-            finding(
-                rule,
-                "MANUAL_REVIEW",
-                "已检测到 Word OMML 公式；允许的公式编辑器仍需人工确认。",
-                paragraph=targets[0],
-                observed={"omath_count": count, "editor_evidence": "Word Equation"},
-                confidence=0.99,
-            )
-        ]
-    return [
-        finding(
-            rule,
-            "MANUAL_REVIEW",
-            "已检测到 Word OMML 公式；允许的公式编辑器仍需人工确认。",
-            target=ctx.document_target,
-            observed={"omath_count": count, "editor_evidence": "Word Equation"},
-            confidence=0.99,
+    requirement = expected_for(rule)
+    allowed_values = requirement.get("allowed_editors", [])
+    if not isinstance(allowed_values, Sequence) or isinstance(allowed_values, (str, bytes)):
+        allowed_values = []
+    allowed = {_canonical_equation_editor(value) for value in allowed_values}
+    allowed.discard(None)
+
+    def count_value(value: Any) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    omath_count = count_value(info.get("omath_count", info.get("count", 0)))
+    raw_items = info.get("items", [])
+    items = [dict(item) for item in raw_items if isinstance(item, Mapping)] if isinstance(raw_items, Sequence) and not isinstance(raw_items, (str, bytes)) else []
+    evidence_items: list[dict[str, Any]] = []
+    counts: dict[str, int] = {"Word Equation": 0, "MathType": 0, "Unknown OLE": 0}
+    for item in items:
+        raw_editor = item.get("editor") or item.get("type") or item.get("kind")
+        editor = _canonical_equation_editor(raw_editor)
+        if editor is None:
+            # An object item with no editor metadata is still an unknown OLE;
+            # do not let an opaque item disappear into NOT_APPLICABLE.
+            if str(item.get("kind", "")).casefold() in {"ole", "ole_object", "object", "embedded_object"}:
+                editor = "Unknown OLE"
+            else:
+                continue
+        counts[editor] = counts.get(editor, 0) + 1
+        evidence_items.append(
+            {
+                "id": item.get("id"),
+                "editor": editor,
+                "paragraph_id": item.get("paragraph_id"),
+                "evidence": item.get("evidence", []),
+            }
         )
-    ]
+    editor_counts = info.get("editors", {})
+    if isinstance(editor_counts, Mapping):
+        for raw_name, raw_count in editor_counts.items():
+            if str(raw_name).strip().casefold().replace("_", "") in {"mathtypeorole", "formulaorole"}:
+                # Legacy aggregate; concrete ``items``/editor counters above
+                # are the only safe source for distinguishing MathType from
+                # another OLE object.
+                continue
+            editor = _canonical_equation_editor(raw_name)
+            if editor is None:
+                continue
+            if isinstance(raw_count, Mapping):
+                raw_count = raw_count.get("count", raw_count.get("value", raw_count.get("items", 0)))
+            count = count_value(raw_count)
+            if count > counts.get(editor, 0):
+                counts[editor] = count
+                evidence_items.append(
+                    {
+                        "id": None,
+                        "editor": editor,
+                        "paragraph_id": None,
+                        "evidence": [f"editors.{raw_name}"],
+                    }
+                )
+    if omath_count > counts["Word Equation"]:
+        counts["Word Equation"] = omath_count
+        existing = sum(item["editor"] == "Word Equation" for item in evidence_items)
+        for index in range(omath_count - existing):
+            evidence_items.append({"id": f"omml-{index:06d}", "editor": "Word Equation", "paragraph_id": None, "evidence": ["omath_count"]})
+
+    editor_names = sorted(name for name, count in counts.items() if count > 0)
+    object_count = count_value(info.get("object_count", 0))
+    if object_count > sum(counts.get(name, 0) for name in ("MathType", "Unknown OLE")):
+        # The count proves an object exists but not which editor owns it.
+        counts["Unknown OLE"] += object_count - sum(counts.get(name, 0) for name in ("MathType", "Unknown OLE"))
+        editor_names = sorted(name for name, count in counts.items() if count > 0)
+        evidence_items.append({"id": None, "editor": "Unknown OLE", "paragraph_id": None, "evidence": ["object_count_without_item"]})
+
+    if not editor_names and not ctx.classified("equation"):
+        return [finding(rule, "NOT_APPLICABLE", "文档中未检测到公式或相关嵌入对象。", target=ctx.document_target)]
+    if not editor_names:
+        editor_names = ["Unknown OLE"]
+        counts["Unknown OLE"] = 1
+
+    observed = {
+        "editors": editor_names,
+        "editor_counts": {name: counts[name] for name in editor_names},
+        "items": evidence_items,
+        "omath_count": omath_count,
+    }
+    paragraph_id = next((item.get("paragraph_id") for item in evidence_items if item.get("paragraph_id")), None)
+    target = next((paragraph for paragraph in ctx.paragraph_list if paragraph.get("id") == paragraph_id), None)
+    if "Unknown OLE" in editor_names or not set(editor_names).issubset(allowed):
+        status = "MANUAL_REVIEW"
+        message = "公式编辑器证据包含未知或不在允许列表中的对象，当前需人工复核。"
+    else:
+        status = "PASS"
+        message = "公式编辑器均已由 Inspector 证据确认并属于允许列表。"
+    kwargs: dict[str, Any] = {"observed": observed, "confidence": 0.99}
+    if target is not None:
+        kwargs["paragraph"] = target
+    else:
+        kwargs["target"] = ctx.document_target
+    return [finding(rule, status, message, **kwargs)]
+
+
+def _canonical_equation_editor(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip().casefold().replace("_", " ").replace("-", " ")
+    compact = re.sub(r"\s+", "", text)
+    if compact in {"wordequation", "omml", "omath", "omathpara", "officeequation"} or "wordequation" in compact:
+        return "Word Equation"
+    if ("mathtype" in compact and "orole" not in compact) or compact in {"equation.3", "equation3", "mtef"}:
+        return "MathType"
+    if compact in {"oleunknown", "unknownole", "unknownobject", "ole", "embeddedobject"} or "unknownole" in compact:
+        return "Unknown OLE"
+    if compact in {"word", "equation"}:
+        return "Word Equation"
+    return str(value).strip() or None
 
 
 def _equation_where(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, Any]]:
@@ -565,42 +932,102 @@ def _reference_layout(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[st
 
 def _latin_font(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, Any]]:
     requirement = expected_for(rule)
-    targets: list[tuple[Mapping[str, Any], float]] = []
+    targets: list[tuple[Mapping[str, Any], float, str]] = []
+    seen_ids: set[tuple[str, str]] = set()
+    nested_note_ids: set[str] = set()
+
+    # Prefer note-part paragraphs when available.  ``RuleContext`` also keeps
+    # one compatibility-level item per note; skipping that envelope avoids a
+    # duplicate finding for every nested footnote paragraph.
+    note_info = footnote_info(ctx.inspection)
+    raw_note_items = note_info.get("items", note_info.get("paragraphs", []))
+    if isinstance(raw_note_items, Sequence) and not isinstance(raw_note_items, (str, bytes)):
+        for note_index, raw_note in enumerate(raw_note_items):
+            if not isinstance(raw_note, Mapping):
+                continue
+            note_id = str(raw_note.get("id", note_index))
+            nested = raw_note.get("paragraphs", [])
+            if not isinstance(nested, Sequence) or isinstance(nested, (str, bytes)) or not nested:
+                continue
+            for paragraph_index, raw_paragraph in enumerate(nested):
+                if not isinstance(raw_paragraph, Mapping):
+                    continue
+                paragraph = dict(raw_paragraph)
+                paragraph.setdefault("id", f"footnotes-{note_id}-p-{paragraph_index:04d}")
+                paragraph.setdefault("index", paragraph_index)
+                paragraph.setdefault("kind", "footnote")
+                paragraph.setdefault("footnote_id", raw_note.get("id", note_index))
+                nested_note_ids.add(f"footnote-{note_id}")
+                _append_latin_target(targets, seen_ids, paragraph, 0.99, "footnote")
+
     for paragraph in ctx.paragraph_list:
+        kind = str(paragraph.get("kind", "")).casefold()
+        if kind in {"footnote", "ordinary_footnote", "endnote"} and str(paragraph.get("id")) in nested_note_ids:
+            continue
         text = text_of(paragraph)
         if not text_has_latin_or_digit(text):
             continue
-        runs = meaningful_runs(paragraph)
-        if runs:
-            for run in runs:
-                if text_has_latin_or_digit(text_of(run)):
-                    targets.append((paragraph, 0.99))
-                    break
-        else:
-            targets.append((paragraph, 0.80))
+        scope = "footnote" if kind in {"footnote", "ordinary_footnote", "endnote"} else "body"
+        _append_latin_target(targets, seen_ids, paragraph, 0.99 if meaningful_runs(paragraph) else 0.80, scope)
+    for paragraph in ctx.table_paragraphs():
+        if text_has_latin_or_digit(text_of(paragraph)):
+            _append_latin_target(targets, seen_ids, paragraph, 0.99 if meaningful_runs(paragraph) else 0.80, "table")
     if not targets:
         return [finding(rule, "NOT_APPLICABLE", "文档中没有可检查的英文字母或数字。", target=ctx.document_target)]
     results: list[dict[str, Any]] = []
-    for paragraph, confidence in targets:
+    for paragraph, confidence, scope in targets:
         mismatches: dict[str, Any] = {}
-        observed: dict[str, Any] = {}
+        observed: dict[str, Any] = {"scope": scope, "font_runs": []}
         runs = meaningful_runs(paragraph)
         for run in runs or [paragraph]:
             run_text = text_of(run)
             if not text_has_latin_or_digit(run_text or text_of(paragraph)):
                 continue
-            actual_ascii = run_value(run, "ascii_font") if run is not paragraph else value_from(paragraph, "ascii_font")
-            actual_hansi = run_value(run, "hansi_font") if run is not paragraph else value_from(paragraph, "hansi_font")
-            observed.update({"ascii_font": actual_ascii, "hansi_font": actual_hansi})
-            if actual_ascii != requirement.get("ascii_font"):
-                mismatches["ascii_font"] = {"observed": actual_ascii, "expected": requirement.get("ascii_font")}
-            if actual_hansi != requirement.get("hansi_font"):
-                mismatches["hansi_font"] = {"observed": actual_hansi, "expected": requirement.get("hansi_font")}
+            actual_ascii = run_value(run, "ascii_font")
+            actual_hansi = run_value(run, "hansi_font")
+            run_observed = {"ascii_font": actual_ascii, "hansi_font": actual_hansi}
+            observed["font_runs"].append(run_observed)
+            observed.setdefault("ascii_font", actual_ascii)
+            observed.setdefault("hansi_font", actual_hansi)
+            if not _font_equal(actual_ascii, requirement.get("ascii_font")):
+                mismatches.setdefault("ascii_font", {"observed": actual_ascii, "expected": requirement.get("ascii_font")})
+            if not _font_equal(actual_hansi, requirement.get("hansi_font")):
+                mismatches.setdefault("hansi_font", {"observed": actual_hansi, "expected": requirement.get("hansi_font")})
+        target = paragraph_target(paragraph, ctx.role(paragraph))
+        if scope != "body":
+            target["scope"] = scope
+            for key in ("table_id", "table_index", "cell_id", "cell_index", "footnote_id"):
+                if paragraph.get(key) is not None:
+                    target[key] = paragraph[key]
         if mismatches:
-            results.append(finding(rule, rule_severity(rule), "英文字母或数字字体不符合规则要求。", paragraph=paragraph, observed=observed, confidence=confidence))
+            results.append(finding(rule, rule_severity(rule), "英文字母或数字字体不符合规则要求。", target=target, paragraph=paragraph, observed=observed, confidence=confidence))
         else:
-            results.append(finding(rule, "PASS", "英文字母和数字字体符合规则。", paragraph=paragraph, observed=observed, confidence=confidence))
+            results.append(finding(rule, "PASS", "英文字母和数字字体符合规则。", target=target, paragraph=paragraph, observed=observed, confidence=confidence))
     return results
+
+
+def _append_latin_target(
+    targets: list[tuple[Mapping[str, Any], float, str]],
+    seen_ids: set[tuple[str, str]],
+    paragraph: Mapping[str, Any],
+    confidence: float,
+    scope: str,
+) -> None:
+    paragraph_id = str(paragraph.get("id", ""))
+    # Inspector IDs are globally stable across body/table/note parts.  Use the
+    # ID alone when available so a malformed producer cannot create duplicate
+    # findings by exposing the same target through two scopes.
+    key = ("id", paragraph_id) if paragraph_id else (scope, f"anonymous-{len(targets)}")
+    if key in seen_ids:
+        return
+    seen_ids.add(key)
+    targets.append((paragraph, confidence, scope))
+
+
+def _font_equal(actual: Any, expected: Any) -> bool:
+    if actual is None or expected is None:
+        return actual == expected
+    return str(actual).strip().casefold() == str(expected).strip().casefold()
 
 
 def _page_range(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, Any]]:
@@ -609,20 +1036,104 @@ def _page_range(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, Any
     entries = _reference_entries(ctx)
     if not entries:
         return [finding(rule, "NOT_APPLICABLE", "未识别到参考文献条目。", target=ctx.document_target)]
-    pattern = re.compile(r"\b\d+\s*([\-‐‑‒–—―])\s*\d+\b")
+    pattern = re.compile(r"(?<!\d)\d+\s*([\-‐‑‒–—―])\s*\d+(?!\d)")
     results: list[dict[str, Any]] = []
     for paragraph in entries:
         text = text_of(paragraph)
-        match = pattern.search(text)
-        if not match:
+        matches = list(pattern.finditer(text))
+        if not matches:
             continue
-        observed_separator = match.group(1)
-        observed = {"separator": observed_separator}
-        if observed_separator != separator:
+        parenthesized_ranges = _parenthesized_spans(text)
+        candidates: list[dict[str, Any]] = []
+        for match in matches:
+            span = [match.start(), match.end()]
+            before = text[: match.start()]
+            after_last_colon = max(before.rfind(":"), before.rfind("："))
+            page_marker = bool(re.search(r"(?:\bpp?\.?|\bpages?)\s*$", before, re.IGNORECASE))
+            in_parenthesized = any(start <= match.start() and match.end() <= end for start, end in parenthesized_ranges)
+            number_parts = re.split(r"\s*[-‐‑‒–—―]\s*", match.group(0))
+            is_year_range = (
+                len(number_parts) == 2
+                and all(len(part) == 4 and part[:2] in {"19", "20"} for part in number_parts)
+            )
+            candidates.append(
+                {
+                    "span": span,
+                    "observed_span": match.group(0),
+                    "separator": match.group(1),
+                    "context": text[max(0, match.start() - 24) : min(len(text), match.end() + 24)],
+                    "in_parenthesized_range": in_parenthesized,
+                    "likely_year_range": is_year_range,
+                    "after_last_colon": bool(after_last_colon >= 0 and match.start() > after_last_colon),
+                    "after_page_marker": page_marker,
+                    "reason": (
+                        "inside_parenthesized_range"
+                        if in_parenthesized
+                        else "likely_publication_year_range"
+                        if is_year_range
+                        else "candidate_after_page_marker"
+                        if page_marker
+                        else "candidate_after_colon"
+                        if after_last_colon >= 0 and match.start() > after_last_colon
+                        else "unmarked_numeric_range"
+                    ),
+                }
+            )
+        eligible = [item for item in candidates if not item["in_parenthesized_range"] and not item["likely_year_range"]]
+        if not eligible:
+            observed = {
+                "candidates": candidates,
+                "selection_reason": "all numeric ranges are parenthesized issue/volume or likely publication-year candidates; pages field is not observable",
+            }
+            results.append(finding(rule, "MANUAL_REVIEW", "检测到疑似卷期范围，但无法可靠定位页码字段。", paragraph=paragraph, observed=observed))
+            continue
+        marked = [item for item in eligible if item["after_last_colon"] or item["after_page_marker"]]
+        if marked:
+            selected = max(marked, key=lambda item: item["span"][0])
+            reason = "selected the last non-parenthesized range after the final colon or page marker"
+        elif len(eligible) == 1:
+            selected = eligible[0]
+            reason = "single non-parenthesized numeric range treated as a bare page range"
+        else:
+            observed = {
+                "candidates": candidates,
+                "selection_reason": "multiple non-parenthesized ranges lack a colon/page marker boundary",
+            }
+            results.append(finding(rule, "MANUAL_REVIEW", "检测到多个数字范围，但无法可靠判断哪一处是页码。", paragraph=paragraph, observed=observed))
+            continue
+        for item in candidates:
+            item["selected"] = item is selected
+        observed = {
+            "separator": selected["separator"],
+            "selected_span": selected["observed_span"],
+            "selected_span_start": selected["span"][0],
+            "selected_span_end": selected["span"][1],
+            "selection_reason": reason,
+            "candidates": candidates,
+        }
+        if selected["separator"] != separator:
             results.append(finding(rule, rule_severity(rule), "参考文献页码范围分隔符不符合规则。", paragraph=paragraph, observed=observed))
         else:
             results.append(finding(rule, "PASS", "参考文献页码范围分隔符符合规则。", paragraph=paragraph, observed=observed))
     return results or [finding(rule, "NOT_APPLICABLE", "参考文献中未检测到页码范围。", target=ctx.document_target)]
+
+
+def _parenthesized_spans(text: str) -> list[tuple[int, int]]:
+    """Return simple nested-free ASCII/fullwidth parenthesized spans."""
+
+    spans: list[tuple[int, int]] = []
+    for opening, closing in (("(", ")"), ("（", "）")):
+        start = 0
+        while True:
+            left = text.find(opening, start)
+            if left < 0:
+                break
+            right = text.find(closing, left + 1)
+            if right < 0:
+                break
+            spans.append((left, right + 1))
+            start = right + 1
+    return sorted(spans)
 
 
 def _manual_reference_rule(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, Any]]:
@@ -638,10 +1149,130 @@ def _table_targets(ctx: RuleContext, *, notes: bool) -> list[dict[str, Any]]:
     for paragraph in targets:
         is_note = bool(re.match(r"^\s*注\s*[：:，,、]", text_of(paragraph)))
         if is_note == notes:
-            result.append(paragraph)
+            target = dict(paragraph)
+            _attach_table_relation_evidence(ctx, target, relation_key="font_size_relation_to_table" if notes else "font_size_relation_to_body")
+            result.append(target)
     if notes:
         result.extend(_inspector_table_note_targets(ctx, result))
     return result
+
+
+_UNKNOWN_RELATION_VALUES = {
+    "",
+    "unknown",
+    "mixed",
+    "ambiguous",
+    "unavailable",
+    "not_checked",
+    "not-checked",
+    "missing",
+    "insufficient_evidence",
+}
+
+
+def _normalized_relation(value: Any) -> str | None:
+    if isinstance(value, Mapping):
+        for key in ("relation", "value", "status", "classification", "result"):
+            if value.get(key) is not None:
+                return _normalized_relation(value.get(key))
+        return None
+    if value is None:
+        return None
+    return str(value).strip().casefold().replace("-", "_").replace(" ", "_")
+
+
+def _comparison_relation(comparison: Any, relation_key: str) -> tuple[Any, dict[str, Any] | None]:
+    if not isinstance(comparison, Mapping):
+        return None, None
+    direct = comparison.get(relation_key)
+    if direct is not None:
+        return direct, dict(comparison)
+    aliases = {
+        "font_size_relation_to_body": ("body_relation", "relation_to_body", "body", "table_to_body"),
+        "font_size_relation_to_table": ("table_relation", "relation_to_table", "note_to_table", "note"),
+    }
+    for key in aliases.get(relation_key, ()):
+        if comparison.get(key) is not None:
+            value = comparison.get(key)
+            if isinstance(value, Mapping):
+                nested = value.get("relation") or value.get("value") or value.get("status")
+                return nested if nested is not None else value, dict(comparison)
+            return value, dict(comparison)
+    target_pt = _numeric(comparison.get("target_pt"))
+    baseline_pt = _numeric(comparison.get("baseline_pt"))
+    if target_pt is None or baseline_pt is None:
+        return None, dict(comparison) if comparison else None
+    if comparison.get("mixed") is True or comparison.get("mixed_runs") is True or comparison.get("status") in {"mixed", "unknown"}:
+        return "mixed", dict(comparison)
+    if abs(target_pt - baseline_pt) < 0.01:
+        return "same", dict(comparison)
+    return ("smaller" if target_pt < baseline_pt else "larger"), dict(comparison)
+
+
+def _numeric(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _table_by_target(ctx: RuleContext, target: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    tables = ctx.inspection.get("tables", [])
+    if not isinstance(tables, Sequence) or isinstance(tables, (str, bytes)):
+        return None
+    table_id = target.get("table_id")
+    table_index = target.get("table_index")
+    for index, table in enumerate(tables):
+        if not isinstance(table, Mapping):
+            continue
+        if table_id is not None and str(table.get("id", "")) == str(table_id):
+            return table
+        if table_index is not None and index == table_index:
+            return table
+    return None
+
+
+def _attach_table_relation_evidence(ctx: RuleContext, target: dict[str, Any], *, relation_key: str) -> None:
+    """Attach only explicit Inspector comparison evidence to a table target."""
+
+    direct = paragraph_value(target, relation_key)
+    table = _table_by_target(ctx, target)
+    comparisons: list[Mapping[str, Any]] = []
+    if table is not None:
+        comparison_keys = (
+            ("comparison", "font_size_comparison", "size_comparison", "comparison_evidence")
+            if relation_key == "font_size_relation_to_body"
+            else ("note_comparison", "table_note_comparison", "note_font_size_comparison")
+        )
+        for key in comparison_keys:
+            value = table.get(key)
+            if isinstance(value, Mapping):
+                comparisons.append(value)
+            elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+                comparisons.extend(item for item in value if isinstance(item, Mapping))
+        for key in (relation_key, "font_size_relation", "relation"):
+            if direct is None and table.get(key) is not None:
+                direct = table.get(key)
+    if direct is None:
+        for comparison in comparisons:
+            relation, evidence = _comparison_relation(comparison, relation_key)
+            if relation is not None:
+                direct = relation
+                if evidence is not None:
+                    target["font_size_comparison"] = evidence
+                break
+    if direct is not None:
+        target[relation_key] = direct
+    if comparisons and "font_size_comparison" not in target:
+        target["font_size_comparison"] = dict(comparisons[0])
+    comparison = target.get("font_size_comparison")
+    if isinstance(comparison, Mapping):
+        relation, _ = _comparison_relation(comparison, relation_key)
+        if relation is not None and target.get(relation_key) is None:
+            target[relation_key] = relation
+        normalized = _normalized_relation(relation)
+        if normalized in _UNKNOWN_RELATION_VALUES:
+            target["comparison_status"] = normalized or "unknown"
 
 
 def _inspector_table_note_targets(
@@ -655,6 +1286,21 @@ def _inspector_table_note_targets(
 
     existing_ids = {str(item.get("id")) for item in existing}
     body_by_id = {str(item.get("id")): item for item in ctx.paragraph_list}
+    body_blocks = ctx.inspection.get("body_blocks", [])
+    body_block_positions: dict[str, int] = {}
+    table_block_positions: dict[str, int] = {}
+    if isinstance(body_blocks, Sequence) and not isinstance(body_blocks, (str, bytes)):
+        for block_index, block in enumerate(body_blocks):
+            if not isinstance(block, Mapping):
+                continue
+            block_id = block.get("id") or block.get("paragraph_id") or block.get("table_id")
+            if block_id is None:
+                continue
+            kind = str(block.get("kind", "")).casefold()
+            if kind == "table" or block.get("table_id") is not None:
+                table_block_positions[str(block.get("table_id") or block_id)] = block_index
+            elif kind in {"paragraph", "body_paragraph"}:
+                body_block_positions[str(block_id)] = block_index
     targets: list[dict[str, Any]] = []
     tables = ctx.inspection.get("tables", [])
     if not isinstance(tables, Sequence) or isinstance(tables, (str, bytes)):
@@ -701,6 +1347,38 @@ def _inspector_table_note_targets(
             if bound is None and nested_bound is not None:
                 nested_id = nested_bound.get("id")
                 bound = body_by_id.get(str(nested_id)) if nested_id is not None else nested_bound
+            table_block_index = table_block_positions.get(table_id)
+            bound_block_index = body_block_positions.get(str(bound_id)) if bound_id is not None else None
+            if table_block_index is not None and bound_block_index is not None:
+                # The producer contract binds only the first non-empty body
+                # paragraph immediately after this table.  Empty body blocks
+                # may occur between the table and that paragraph, but a new
+                # table/figure/heading closes the binding window.
+                first_nonempty_index: int | None = None
+                for block_index in range(table_block_index + 1, len(body_blocks)):
+                    block = body_blocks[block_index]
+                    if not isinstance(block, Mapping):
+                        continue
+                    block_kind = str(block.get("kind", "")).casefold()
+                    block_id = block.get("id") or block.get("paragraph_id") or block.get("table_id")
+                    block_text = text_of(block)
+                    if block_kind in {"table", "figure", "image", "heading", "heading_level_1", "heading_level_2", "heading_level_3", "heading_level_4"}:
+                        break
+                    if block_kind in {"paragraph", "body_paragraph"} and block_text.strip():
+                        first_nonempty_index = block_index
+                        break
+                    if block_id is not None and str(block_id) == str(bound_id):
+                        first_nonempty_index = block_index
+                        break
+                if first_nonempty_index is None or bound_block_index != first_nonempty_index:
+                    continue
+                candidate_distance = candidate.get("distance", candidate.get("body_distance"))
+                if candidate_distance is not None:
+                    try:
+                        if int(candidate_distance) != bound_block_index - table_block_index:
+                            continue
+                    except (TypeError, ValueError):
+                        continue
             candidate_preview = candidate.get("text_preview")
             if not isinstance(candidate_preview, str) and nested_bound is not None:
                 candidate_preview = nested_bound.get("text_preview")
@@ -720,10 +1398,34 @@ def _inspector_table_note_targets(
                 }
             target["table_id"] = table_id
             target["table_note_candidate"] = True
-            target.setdefault("in_table", bool(target.get("table_id") == table_id))
+            target.setdefault("in_table", bool(target.get("in_table", False)))
+            target["table_note_binding"] = {
+                "source": "inspector.note_candidates",
+                "table_id": table_id,
+                "paragraph_id": target.get("id"),
+                "distance": candidate.get("distance", candidate.get("body_distance", 1)),
+                "body_block_index": bound_block_index,
+                "table_block_index": table_block_index,
+                "reason": candidate.get("reason") or candidate.get("binding_reason") or "first_nonempty_paragraph_after_table",
+            }
             for key in ("formatting", "effective_formatting", "formatting_evidence", "runs"):
                 if key in candidate and key not in target:
                     target[key] = candidate[key]
+            for key in (
+                "font_size_relation_to_body",
+                "font_size_relation_to_table",
+                "font_size_comparison",
+                "comparison",
+                "comparison_evidence",
+                "comparison_status",
+            ):
+                if key in candidate and key not in target:
+                    target[key] = candidate[key]
+            _attach_table_relation_evidence(
+                ctx,
+                target,
+                relation_key="font_size_relation_to_table",
+            )
             if str(target.get("id")) not in existing_ids:
                 targets.append(target)
                 existing_ids.add(str(target.get("id")))
@@ -736,7 +1438,70 @@ def _table_rule(rule: Mapping[str, Any], ctx: RuleContext, *, notes: bool) -> li
     targets = _table_targets(ctx, notes=notes)
     if not targets:
         return [finding(rule, "NOT_APPLICABLE", "未识别到表格内目标段落。", target=ctx.document_target)]
-    return _format_targets(rule, ctx, targets, missing_message="未识别到表格内目标段落。")
+    relation_key = "font_size_relation_to_table" if notes else "font_size_relation_to_body"
+    results: list[dict[str, Any]] = []
+    for target in targets:
+        relation = paragraph_value(target, relation_key)
+        normalized = _normalized_relation(relation)
+        observed = observed_formatting(target)
+        for key in ("table_note_binding", "font_size_comparison", "table_id", "table_note_candidate"):
+            if target.get(key) is not None:
+                observed[key] = target[key]
+        if relation is not None:
+            observed[relation_key] = relation
+        if normalized in _UNKNOWN_RELATION_VALUES or target.get("comparison_status") in _UNKNOWN_RELATION_VALUES:
+            observed["comparison_status"] = normalized or target.get("comparison_status") or "unknown"
+            if target.get("font_size_comparison") is not None:
+                observed["font_size_comparison"] = target["font_size_comparison"]
+            results.append(
+                finding(
+                    rule,
+                    "MANUAL_REVIEW",
+                    "表格字号比较证据显示混合/未知状态，当前需人工复核。",
+                    paragraph=target,
+                    target=paragraph_target(target, ctx.role(target)),
+                    observed=observed,
+                    confidence=0.80,
+                )
+            )
+            continue
+        checked = check_paragraph_format(rule, target, role=ctx.role(target))
+        if checked:
+            if checked.get("unchecked"):
+                results.append(
+                    finding(
+                        rule,
+                        "MANUAL_REVIEW",
+                        "表格字号缺少 Inspector 产生的可验证比较关系，当前需人工复核。",
+                        paragraph=target,
+                        target=paragraph_target(target, ctx.role(target)),
+                        observed=checked["observed"],
+                        confidence=0.80,
+                    )
+                )
+            else:
+                results.append(
+                    finding(
+                        rule,
+                        rule_severity(rule),
+                        mismatch_message(rule, checked["mismatches"]),
+                        paragraph=target,
+                        target=paragraph_target(target, ctx.role(target)),
+                        observed=checked["observed"],
+                    )
+                )
+        else:
+            results.append(
+                finding(
+                    rule,
+                    "PASS",
+                    f"{rule.get('target', '目标')}已满足规则要求。",
+                    paragraph=target,
+                    target=paragraph_target(target, ctx.role(target)),
+                    observed=observed or {"formatting": True},
+                )
+            )
+    return results
 
 
 def _figure_caption(rule: Mapping[str, Any], ctx: RuleContext) -> list[dict[str, Any]]:

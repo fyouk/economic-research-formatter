@@ -315,7 +315,7 @@ def value_from(mapping: Mapping[str, Any] | None, canonical: str) -> Any:
             return lowered[alias.casefold()]
     # Inspector versions may keep run formatting under an envelope.  Recurse
     # only through known envelopes; arbitrary nested values are not guessed.
-    for key in ("effective", "resolved", "formatting", "raw"):
+    for key in ("effective", "resolved", "formatting", "raw", "font"):
         nested = mapping.get(key)
         if isinstance(nested, Mapping):
             value = value_from(nested, canonical)

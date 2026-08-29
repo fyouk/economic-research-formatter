@@ -130,6 +130,26 @@ def _numbering_level(paragraph: Mapping[str, Any]) -> int | None:
     return None
 
 
+def _outline_level(paragraph: Mapping[str, Any]) -> int | None:
+    """Return the effective Word outline level when Inspector exposed one."""
+
+    candidates: list[Any] = [paragraph.get("outline_level")]
+    for envelope in ("properties", "paragraph_properties"):
+        value = paragraph.get(envelope)
+        if isinstance(value, Mapping):
+            effective = value.get("effective")
+            if isinstance(effective, Mapping):
+                candidates.append(effective.get("outline_level"))
+            candidates.append(value.get("outline_level"))
+    for value in candidates:
+        try:
+            if value is not None:
+                return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def _role_hint(paragraph: Mapping[str, Any]) -> str | None:
     value = paragraph.get("role_hint") or paragraph.get("role")
     if isinstance(value, Mapping):
@@ -192,6 +212,26 @@ _EQUATION_WHERE_RE = re.compile(r"^\s*其中(?=$|\s|[：:，,、；;])")
 _AUTHOR_INFORMATION_RE = re.compile(
     r"(?:电子信箱|电子邮箱|通讯作者|作者简介|作者信息|作者单位|作者联系)"
 )
+_AUTHOR_INFORMATION_TERM_RE = re.compile(r"电子信箱|电子邮箱")
+
+
+def _has_inspector_span_evidence(value: Mapping[str, Any]) -> bool:
+    """Return whether a producer supplied run offsets for this text."""
+
+    runs = value.get("runs")
+    if isinstance(runs, Sequence) and not isinstance(runs, (str, bytes)):
+        if any(
+            isinstance(run, Mapping) and run.get("start") is not None and run.get("end") is not None
+            for run in runs
+        ):
+            return True
+    nested = value.get("paragraphs")
+    if isinstance(nested, Sequence) and not isinstance(nested, (str, bytes)):
+        return any(
+            isinstance(item, Mapping) and _has_inspector_span_evidence(item)
+            for item in nested
+        )
+    return False
 
 
 def _is_equation_where_text(text: str) -> bool:
@@ -205,6 +245,52 @@ def _is_equation_where_text(text: str) -> bool:
     return bool(_EQUATION_WHERE_RE.match(text))
 
 
+def _heading_structure(paragraph: Mapping[str, Any]) -> tuple[int | None, list[str]]:
+    """Resolve independent heading-level evidence exposed by Inspector.
+
+    A visible marker is not an independent level signal: an incorrectly
+    swapped ``1.``/``（1）`` pair would otherwise classify itself into a
+    self-consistent hierarchy.  Style, outline, and resolved numbering are
+    retained separately and used when they provide a heading-level signal.
+    """
+
+    style_level = _style_heading_level(paragraph.get("style_name") or paragraph.get("style"))
+    outline_level = _outline_level(paragraph)
+    numbering_level = _numbering_level(paragraph)
+    evidence: list[str] = []
+    if style_level is not None:
+        evidence.append(f"style=heading_level_{style_level}")
+    if outline_level is not None:
+        evidence.append(f"outline_level={outline_level}")
+    if numbering_level is not None:
+        evidence.append(f"numbering_ilvl={numbering_level}")
+
+    # Word outline levels and numbering ilvls are zero-based.  When both are
+    # available they are the strongest independent agreement.  A non-generic
+    # Heading 2/3/4 style is also sufficient on its own; Heading 1 remains
+    # deliberately generic so visible thesis numbering keeps its established
+    # precedence (for example, a Heading 1-styled ``1.1`` is still L2).
+    outline_heading = outline_level + 1 if outline_level in range(4) else None
+    numbering_heading = numbering_level + 1 if numbering_level in range(4) else None
+    if outline_heading is not None and numbering_heading is not None and outline_heading == numbering_heading:
+        level = outline_heading
+    elif outline_heading is not None and style_level is not None and outline_heading == style_level:
+        level = outline_heading
+    elif numbering_heading is not None and style_level is not None and style_level != 1 and numbering_heading == style_level:
+        level = numbering_heading
+    elif style_level is not None and style_level in {2, 3, 4}:
+        level = style_level
+    elif outline_heading is not None:
+        level = outline_heading
+    elif numbering_heading is not None and (style_level is not None or outline_level is not None):
+        level = numbering_heading
+    else:
+        level = None
+    if level is not None:
+        evidence.append(f"structural_level={level}")
+    return level, evidence
+
+
 def _heading_role(text: str, paragraph: Mapping[str, Any]) -> tuple[str | None, list[str], float]:
     """Return a heading role based on shape, style, and numbering metadata."""
 
@@ -212,6 +298,25 @@ def _heading_role(text: str, paragraph: Mapping[str, Any]) -> tuple[str | None, 
         return None, [], 0.0
     style_level = _style_heading_level(paragraph.get("style_name") or paragraph.get("style"))
     numbering_level = _numbering_level(paragraph)
+    structural_level, structural_evidence = _heading_structure(paragraph)
+    if structural_level is not None and structural_level in range(1, 5):
+        evidence = list(structural_evidence)
+        visible_role: str | None = None
+        if CHAPTER_HEADING_RE.match(text) or CHINESE_LEVEL_1_RE.match(text):
+            visible_role = "heading_level_1"
+        elif CHINESE_LEVEL_2_RE.match(text):
+            visible_role = "heading_level_2"
+        elif DECIMAL_HEADING_RE.match(text):
+            match = DECIMAL_HEADING_RE.match(text)
+            assert match is not None
+            visible_role = f"heading_level_{min(4, max(2, len(match.group(1).split('.'))))}"
+        elif ONE_DOT_HEADING_RE.match(text):
+            visible_role = "heading_level_3"
+        elif PAREN_LEVEL_RE.match(text):
+            visible_role = "heading_level_4"
+        if visible_role is not None and visible_role != f"heading_level_{structural_level}":
+            evidence.append(f"visible_prefix_level={visible_role.rsplit('_', 1)[-1]}")
+        return f"heading_level_{structural_level}", evidence, 0.99
     # Visible numbering is stronger semantic evidence than a generic Word
     # style.  Real-world thesis documents often apply Heading 1 to every
     # numbered heading; letting the style win would collapse 1.1/1.1.1 into
@@ -371,9 +476,15 @@ def _classify_paragraphs(inspection: Mapping[str, Any]) -> list[dict[str, Any]]:
             heading_role, heading_evidence, heading_confidence = _heading_role(text, paragraph)
             if heading_role:
                 role, evidence, confidence = heading_role, heading_evidence, heading_confidence
-            elif re.search(r"(?:电子信箱|电子邮箱|通讯作者|作者简介|作者信息|作者单位)", text) and not abstract_open:
-                role, confidence = "author_information", 0.78
+            elif _AUTHOR_INFORMATION_RE.search(text) and not abstract_open:
+                role = "author_information"
+                explicit_spans = list(_AUTHOR_INFORMATION_TERM_RE.finditer(text))
+                confidence = 0.96 if explicit_spans and _has_inspector_span_evidence(paragraph) else 0.78
                 evidence.append("author_information_marker")
+                evidence.extend(
+                    f"author_information_span={match.start()}:{match.end()}"
+                    for match in explicit_spans
+                )
             elif "author" in lower_style(paragraph.get("style_name") or paragraph.get("style")) or "作者" in clean_text(paragraph.get("style_name") or paragraph.get("style")):
                 role, confidence = "author_name", 0.80
                 evidence.append("paragraph_style=author")
@@ -454,8 +565,13 @@ def _classify_note_items(inspection: Mapping[str, Any]) -> list[dict[str, Any]]:
             evidence = ["explicit_note_role"]
         elif _AUTHOR_INFORMATION_RE.search(text):
             role = "author_information"
-            confidence = 0.78
+            explicit_spans = list(_AUTHOR_INFORMATION_TERM_RE.finditer(text))
+            confidence = 0.96 if explicit_spans and _has_inspector_span_evidence(item) else 0.78
             evidence = ["author_information_marker", "footnote_item"]
+            evidence.extend(
+                f"author_information_span={match.start()}:{match.end()}"
+                for match in explicit_spans
+            )
         else:
             role = "ordinary_footnote"
             confidence = 0.90

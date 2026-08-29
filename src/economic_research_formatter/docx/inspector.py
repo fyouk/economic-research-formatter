@@ -91,23 +91,160 @@ def _run_elements(paragraph: etree._Element) -> list[etree._Element]:
     return list(paragraph.iter(qname(W_NS, "r")))
 
 
-def _note_reference_evidence(paragraph: etree._Element) -> dict[str, Any]:
+def _note_marker_properties(package: DocxPackage) -> dict[str, dict[str, Any]]:
+    """Read note numbering properties that affect automatic marker meaning.
+
+    ``w:footnoteReference`` has no display glyph of its own.  In the absence
+    of ``w:customMarkFollows`` Word uses the note numbering format configured
+    on the section (decimal by default).  Keeping that small piece of section
+    evidence with every reference lets downstream checks distinguish a normal
+    numbered footnote from a custom ``*`` marker without guessing from text.
+    """
+
+    result: dict[str, dict[str, Any]] = {}
+    for part_type, property_name in (("footnote", "footnotePr"), ("endnote", "endnotePr")):
+        properties: dict[str, Any] = {
+            "numFmt": "decimal",
+            "numStart": None,
+            "numRestart": None,
+            "source": "OOXML default",
+        }
+        found = False
+        for sect_pr in package.document_root.iter(qname(W_NS, "sectPr")):
+            note_pr = sect_pr.find(qname(W_NS, property_name))
+            if note_pr is None:
+                continue
+            found = True
+            for child_name, key in (("numFmt", "numFmt"), ("numStart", "numStart"), ("numRestart", "numRestart")):
+                child = note_pr.find(qname(W_NS, child_name))
+                value = child.get(qname(W_NS, "val")) if child is not None else None
+                if value is not None:
+                    properties[key] = value
+            properties["source"] = "section_properties"
+            # Section properties may repeat; retaining the last effective
+            # section is consistent with the body traversal's final-section
+            # behavior while remaining deterministic.
+        properties["configured"] = found
+        result[part_type] = properties
+    return result
+
+
+def _literal_marker(text: str) -> str | None:
+    value = text.strip()
+    if len(value) == 1 and not value.isalnum() and not value.isspace():
+        return value
+    return None
+
+
+def _marker_near_reference(
+    reference: etree._Element,
+    run: etree._Element | None,
+    run_index: int | None,
+    runs: list[etree._Element],
+) -> tuple[str | None, str | None, int | None]:
+    """Return a literal marker, its relative order, and run distance.
+
+    A literal glyph is associated only when it is the sole rendered content
+    immediately before/after the reference in the same run or neighboring
+    run.  A star elsewhere in a title is deliberately not treated as a
+    footnote marker.
+    """
+
+    if run is None or run_index is None:
+        return None, None, None
+    children = [child for child in run if child.tag != qname(W_NS, "rPr")]
+    try:
+        child_index = children.index(reference)
+    except ValueError:
+        child_index = -1
+    if child_index >= 0:
+        before = "".join(_visible_text(child) for child in children[:child_index]).strip()
+        after = "".join(_visible_text(child) for child in children[child_index + 1 :]).strip()
+        before_marker = _literal_marker(before) if before else None
+        after_marker = _literal_marker(after) if after else None
+        if after_marker is not None and before_marker is None:
+            return after_marker, "after", 0
+        if before_marker is not None and after_marker is None:
+            return before_marker, "before", 0
+
+    for neighbor_index, order in ((run_index - 1, "before"), (run_index + 1, "after")):
+        if not 0 <= neighbor_index < len(runs):
+            continue
+        neighbor = runs[neighbor_index]
+        # A neighboring reference is not a literal marker candidate, even
+        # when its rendered text happens to be empty.
+        if list(neighbor.iter(qname(W_NS, "footnoteReference"))) or list(neighbor.iter(qname(W_NS, "endnoteReference"))):
+            continue
+        marker = _literal_marker(_visible_text(neighbor))
+        if marker is not None:
+            return marker, order, 1
+    return None, None, None
+
+
+def _note_reference_evidence(
+    paragraph: etree._Element,
+    note_marker_properties: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Return note-reference IDs plus stable marker evidence for a paragraph."""
 
     references: list[dict[str, Any]] = []
-    run_positions = {id(run): index for index, run in enumerate(_run_elements(paragraph))}
+    runs = _run_elements(paragraph)
+    run_positions = {id(run): index for index, run in enumerate(runs)}
+    note_marker_properties = note_marker_properties or {}
     for tag, kind in (("footnoteReference", "footnote"), ("endnoteReference", "endnote")):
         for reference in paragraph.iter(qname(W_NS, tag)):
             raw_id = reference.get(qname(W_NS, "id"))
             note_id = _int(raw_id)
             run = next((ancestor for ancestor in reference.iterancestors() if ancestor.tag == qname(W_NS, "r")), None)
+            run_index = run_positions.get(id(run))
+            custom_raw = reference.get(qname(W_NS, "customMarkFollows"))
+            custom_mark_follows = custom_raw in {"1", "true", "on"}
+            literal_marker, association_order, association_distance = _marker_near_reference(
+                reference, run, run_index, runs
+            )
+            properties = deepcopy(note_marker_properties.get(kind, {}))
+            number_format = str(properties.get("numFmt") or "decimal")
+            if custom_mark_follows:
+                if literal_marker == "*":
+                    marker_type = "custom_mark"
+                elif literal_marker is not None:
+                    marker_type = "other_marker"
+                else:
+                    marker_type = "unknown_marker"
+            elif literal_marker == "*":
+                marker_type = "literal_star"
+            elif literal_marker is not None:
+                marker_type = "other_marker"
+            elif number_format.casefold() in {"decimal", "upperroman", "lowerroman", "upperletter", "lowerletter"}:
+                marker_type = "automatic_numbered"
+            elif number_format:
+                marker_type = "automatic_symbol"
+            else:
+                marker_type = "unknown_marker"
             references.append(
                 {
                     "kind": kind,
                     "marker": tag,
                     "id": note_id,
                     "id_raw": raw_id,
-                    "run_index": run_positions.get(id(run)),
+                    "reference_id": note_id,
+                    "run_index": run_index,
+                    "run_order": run_index,
+                    "custom_mark_follows": custom_mark_follows,
+                    "custom_mark_follows_raw": custom_raw,
+                    "marker_type": marker_type,
+                    "marker_kind": marker_type,
+                    "automatic": marker_type in {"automatic_numbered", "automatic_symbol"},
+                    "automatic_numbered": marker_type == "automatic_numbered",
+                    "is_custom_mark": marker_type == "custom_mark",
+                    "marker_value": literal_marker,
+                    "literal_marker": literal_marker,
+                    "association": {
+                        "associated": literal_marker is not None,
+                        "order": association_order,
+                        "run_distance": association_distance,
+                    },
+                    "note_properties": properties,
                 }
             )
     references.sort(key=lambda item: (item["run_index"] if item["run_index"] is not None else 10**9, item["kind"]))
@@ -272,6 +409,38 @@ def _body_tables(body: etree._Element) -> list[etree._Element]:
     ]
 
 
+def _body_blocks(
+    body: etree._Element,
+    paragraph_ids: dict[int, str],
+    table_ids: dict[int, str],
+) -> list[dict[str, Any]]:
+    """Serialize top-level body paragraphs/tables in true OOXML order.
+
+    Word commonly wraps body content in ``w:sdt``/``w:customXml``.  Iterating
+    the body tree and filtering only descendants of another table keeps those
+    wrappers transparent while preventing nested tables/cell paragraphs from
+    appearing as independent body blocks.
+    """
+
+    blocks: list[dict[str, Any]] = []
+    for element in body.iter():
+        if element.tag == qname(W_NS, "p"):
+            if any(ancestor.tag == qname(W_NS, "tbl") for ancestor in element.iterancestors()):
+                continue
+            identifier = paragraph_ids.get(id(element))
+            if identifier is not None:
+                blocks.append({"kind": "paragraph", "id": identifier})
+        elif element.tag == qname(W_NS, "tbl"):
+            if any(ancestor.tag == qname(W_NS, "tbl") for ancestor in element.iterancestors()):
+                continue
+            identifier = table_ids.get(id(element))
+            if identifier is not None:
+                blocks.append({"kind": "table", "id": identifier})
+    for index, block in enumerate(blocks):
+        block["index"] = index
+    return blocks
+
+
 def _core_page_count(package: DocxPackage) -> int | None:
     root = package.xml("docProps/app.xml")
     if root is None:
@@ -280,16 +449,32 @@ def _core_page_count(package: DocxPackage) -> int | None:
     return _int(element.text if element is not None else None)
 
 
-def _core_properties(package: DocxPackage) -> dict[str, Any]:
+def _core_properties(package: DocxPackage, *, include_metadata: bool = False) -> dict[str, Any]:
     root = package.xml("docProps/core.xml")
     if root is None:
         return {}
-    values: dict[str, Any] = {}
+    values: dict[str, str] = {}
+    elements: dict[str, etree._Element] = {}
     for key, namespace in (("title", _DC_NS), ("subject", _DC_NS), ("creator", _DC_NS), ("description", _DC_NS), ("keywords", _CORE_PROPS_NS), ("last_modified_by", _CORE_PROPS_NS)):
         element = root.find(qname(namespace, key.replace("last_modified_by", "lastModifiedBy")))
-        if element is not None and element.text is not None:
-            values[key] = element.text
-    return values
+        if element is not None:
+            elements[key] = element
+            values[key] = element.text or ""
+    if include_metadata:
+        return values
+    # Compact reports are routinely copied into issues and shared with
+    # collaborators.  Keep only presence/hash evidence for the two identity
+    # fields and omit free-form title/subject/description/keywords entirely.
+    redacted: dict[str, Any] = {}
+    for key in ("creator", "last_modified_by"):
+        if key not in elements:
+            continue
+        value = values[key]
+        redacted[key] = {
+            "present": True,
+            "sha256": _bounded_hash(value),
+        }
+    return redacted
 
 
 def _inspect_run(
@@ -340,11 +525,14 @@ def _inspect_paragraph(
     table_context: bool = False,
     table_id: str | None = None,
     in_toc_context: bool = False,
+    note_marker_properties: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     ppr = paragraph.find(qname(W_NS, "pPr"))
     style_id_element = ppr.find(qname(W_NS, "pStyle")) if ppr is not None else None
     style_id = style_id_element.get(qname(W_NS, "val")) if style_id_element is not None else None
     style_name = resolver.style_name(style_id)
+    effective_style_id = style_id or resolver.default_style_id("paragraph")
+    effective_style_name = resolver.style_name(effective_style_id)
     text = _visible_text(paragraph)
     fields = fields_in_paragraph(paragraph, include_text=include_text)
     field_types = [field["type"] for field in fields]
@@ -360,7 +548,7 @@ def _inspect_paragraph(
     )
     p_props = resolver.resolve_paragraph(ppr)
     effective_p_props = p_props["effective"]
-    note_evidence = _note_reference_evidence(paragraph)
+    note_evidence = _note_reference_evidence(paragraph, note_marker_properties)
     numpr = numbering.resolve(ppr)
     runs: list[dict[str, Any]] = []
     offset = 0
@@ -396,6 +584,8 @@ def _inspect_paragraph(
         "section_index": None,
         "style_name": style_name,
         "style_id": style_id,
+        "effective_style_name": effective_style_name,
+        "effective_style_id": effective_style_id,
         "outline_level": effective_p_props["outline_level"],
         "alignment": effective_p_props["alignment"],
         "indent": effective_p_props["indent"],
@@ -484,7 +674,18 @@ def _inspect_table(
         for paragraph in cell["paragraphs"]:
             value = paragraph.get("text", paragraph["text_preview"])
             if value.strip().startswith(("注：", "注:", "Note:")):
-                note_candidates.append({"paragraph_id": paragraph["id"], "text_preview": paragraph["text_preview"]})
+                note_candidates.append(
+                    {
+                        "table_id": table_id,
+                        "paragraph_id": paragraph["id"],
+                        "text_preview": paragraph["text_preview"],
+                        "location": "table_cell",
+                        "reason": "table_cell_note_marker",
+                        "formatting": deepcopy(paragraph.get("formatting", {})),
+                        "effective_formatting": deepcopy(paragraph.get("effective_formatting", {})),
+                        "runs": deepcopy(paragraph.get("runs", [])),
+                    }
+                )
     return {
         "id": table_id,
         "index": table_index,
@@ -495,6 +696,339 @@ def _inspect_table(
         "cells": all_cells,
         "note_candidates": note_candidates,
     }
+
+
+def _record_text(record: dict[str, Any]) -> str:
+    value = record.get("text")
+    if isinstance(value, str):
+        return value
+    value = record.get("text_preview", "")
+    return value if isinstance(value, str) else ""
+
+
+def _note_marker_text(value: str) -> bool:
+    return bool(re.match(r"^\s*注\s*[：:]", value))
+
+
+def _is_heading_block(record: dict[str, Any]) -> bool:
+    if record.get("in_toc") or record.get("toc", {}).get("is_toc"):
+        return True
+    style = str(record.get("style_name") or record.get("style_id") or "").casefold()
+    if "heading" in style or "标题" in style or style.startswith("title"):
+        return True
+    value = _record_text(record).strip()
+    return bool(
+        re.match(r"^(?:第\s*\d+\s*章|[一二三四五六七八九十]+、|\d+(?:\.\d+){0,3}\s+|[（(]\s*\d+\s*[）)])", value)
+    )
+
+
+def _is_figure_block(element: etree._Element) -> bool:
+    return any(
+        node.tag in {qname(W_NS, "drawing"), qname(W_NS, "pict"), qname(W_NS, "object")}
+        for node in element.iter()
+    )
+
+
+def _body_note_candidate(
+    table: dict[str, Any],
+    body_blocks: list[dict[str, Any]],
+    body_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    table_id = str(table.get("id"))
+    positions = {str(block.get("id")): index for index, block in enumerate(body_blocks)}
+    table_position = positions.get(table_id)
+    if table_position is None:
+        return None
+    blocked_reason: str | None = None
+    blocking_id: str | None = None
+    for position in range(table_position + 1, len(body_blocks)):
+        block = body_blocks[position]
+        block_id = str(block.get("id"))
+        if block.get("kind") == "table":
+            blocked_reason = "intervening_table"
+            blocking_id = block_id
+            break
+        paragraph = body_by_id.get(block_id)
+        if paragraph is None:
+            continue
+        element = paragraph.get("_element")
+        if isinstance(element, etree._Element) and _is_figure_block(element):
+            blocked_reason = "intervening_figure"
+            blocking_id = block_id
+            break
+        text = _record_text(paragraph)
+        if not text.strip():
+            continue
+        if _is_heading_block(paragraph):
+            blocked_reason = "intervening_heading"
+            blocking_id = block_id
+            break
+        if not _note_marker_text(text):
+            blocked_reason = "first_nonempty_post_table_is_not_note"
+            blocking_id = block_id
+            break
+        intervening = [item.get("id") for item in body_blocks[table_position + 1 : position]]
+        candidate: dict[str, Any] = {
+            "table_id": table_id,
+            "paragraph_id": block_id,
+            "adjacent_body_paragraph_id": block_id,
+            "text_preview": paragraph.get("text_preview", ""),
+            "location": "body",
+            "distance": position - table_position,
+            "intervening_block_count": max(0, position - table_position - 1),
+            "intervening_block_ids": intervening,
+            "reason": "first_nonempty_post_table_note",
+            "match_reason": "first_nonempty_post_table_paragraph_starts_with_note_marker",
+            "formatting": deepcopy(paragraph.get("formatting", {})),
+            "effective_formatting": deepcopy(paragraph.get("effective_formatting", {})),
+            "formatting_evidence": deepcopy(paragraph.get("formatting_evidence", {})),
+            "runs": deepcopy(paragraph.get("runs", [])),
+        }
+        return candidate
+    if blocked_reason is not None:
+        table["note_binding"] = {
+            "status": "blocked",
+            "table_id": table_id,
+            "reason": blocked_reason,
+            "blocking_block_id": blocking_id,
+        }
+    return None
+
+
+def _bind_adjacent_table_notes(
+    tables: list[dict[str, Any]],
+    paragraphs: list[dict[str, Any]],
+    body_blocks: list[dict[str, Any]],
+    body_elements: dict[str, etree._Element],
+) -> None:
+    """Bind only the first eligible post-table body note to each table."""
+
+    body_by_id: dict[str, dict[str, Any]] = {}
+    for paragraph in paragraphs:
+        value = dict(paragraph)
+        value["_element"] = body_elements.get(str(paragraph.get("id")))
+        body_by_id[str(paragraph.get("id"))] = value
+    for table in tables:
+        candidate = _body_note_candidate(table, body_blocks, body_by_id)
+        if candidate is None:
+            continue
+        table.setdefault("note_candidates", []).append(candidate)
+        table["note_binding"] = {
+            "status": "bound",
+            "table_id": table.get("id"),
+            "paragraph_id": candidate["paragraph_id"],
+            "distance": candidate["distance"],
+            "reason": candidate["reason"],
+        }
+
+
+def _record_run_sizes(record: dict[str, Any]) -> tuple[float | None, str]:
+    values: list[float] = []
+    runs = record.get("runs", [])
+    if not isinstance(runs, list):
+        return None, "missing_runs"
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        text = run.get("text") or run.get("text_preview") or ""
+        if not isinstance(text, str) or not text.strip():
+            continue
+        formatting = run.get("formatting", {})
+        effective = formatting.get("effective", {}) if isinstance(formatting, dict) else {}
+        value = effective.get("size_pt") if isinstance(effective, dict) else None
+        if value is None and isinstance(effective, dict):
+            value = effective.get("size_cs_pt")
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None, "missing_size"
+        values.append(number)
+    if not values:
+        return None, "missing_size"
+    rounded = {round(value, 4) for value in values}
+    if len(rounded) > 1:
+        return None, "mixed_runs"
+    return values[0], "resolved"
+
+
+def _baseline_size(records: list[dict[str, Any]]) -> tuple[float | None, dict[str, Any]]:
+    candidates: list[tuple[str, float]] = []
+    invalid: list[dict[str, Any]] = []
+    for record in records:
+        value = _record_text(record)
+        if not value.strip():
+            continue
+        if record.get("in_toc") or record.get("toc", {}).get("is_toc") or _note_marker_text(value) or _is_heading_block(record):
+            continue
+        size, status = _record_run_sizes(record)
+        if size is None:
+            invalid.append({"paragraph_id": record.get("id"), "reason": status})
+        else:
+            candidates.append((str(record.get("id")), size))
+    unique = {round(value, 4) for _, value in candidates}
+    if invalid:
+        return None, {"status": "unknown", "reason": "unstable_body_baseline", "invalid": invalid}
+    if not candidates:
+        return None, {"status": "unknown", "reason": "missing_body_baseline"}
+    if len(unique) != 1:
+        return None, {
+            "status": "unknown",
+            "reason": "unstable_body_baseline",
+            "sizes_pt": sorted(unique),
+            "paragraph_ids": [paragraph_id for paragraph_id, _ in candidates],
+        }
+    return candidates[0][1], {
+        "status": "resolved",
+        "baseline_pt": candidates[0][1],
+        "paragraph_ids": [paragraph_id for paragraph_id, _ in candidates],
+    }
+
+
+def _table_size(table: dict[str, Any]) -> tuple[float | None, dict[str, Any]]:
+    candidates: list[tuple[str, float]] = []
+    invalid: list[dict[str, Any]] = []
+    for cell in table.get("cells", []):
+        if not isinstance(cell, dict):
+            continue
+        for record in cell.get("paragraphs", []):
+            if not isinstance(record, dict) or _note_marker_text(_record_text(record)):
+                continue
+            if not _record_text(record).strip():
+                continue
+            size, status = _record_run_sizes(record)
+            if size is None:
+                invalid.append({"paragraph_id": record.get("id"), "reason": status})
+            else:
+                candidates.append((str(record.get("id")), size))
+    unique = {round(value, 4) for _, value in candidates}
+    if invalid:
+        return None, {"status": "unknown", "reason": "unstable_table_size", "invalid": invalid}
+    if not candidates:
+        return None, {"status": "unknown", "reason": "missing_table_size"}
+    if len(unique) != 1:
+        return None, {
+            "status": "unknown",
+            "reason": "unstable_table_size",
+            "sizes_pt": sorted(unique),
+            "paragraph_ids": [paragraph_id for paragraph_id, _ in candidates],
+        }
+    return candidates[0][1], {
+        "status": "resolved",
+        "table_pt": candidates[0][1],
+        "paragraph_ids": [paragraph_id for paragraph_id, _ in candidates],
+    }
+
+
+def _size_relation(
+    target: float | None,
+    baseline: float | None,
+    *,
+    reason: str | None = None,
+    classify_one_cn_step: bool = False,
+) -> tuple[str, dict[str, Any]]:
+    comparison: dict[str, Any] = {
+        "target_pt": target,
+        "baseline_pt": baseline,
+        "source": "effective_run_formatting",
+    }
+    if target is None or baseline is None:
+        comparison["reason"] = reason or "missing_or_unstable_size_evidence"
+        return "unknown", comparison
+    delta = baseline - target
+    if abs(delta) < 0.01:
+        relation = "equal"
+    elif delta > 0:
+        relation = "one_cn_size_smaller" if classify_one_cn_step and abs(delta - 1.5) < 0.01 else "smaller"
+    else:
+        relation = "larger"
+    return relation, comparison
+
+
+def _apply_size_relation(
+    record: dict[str, Any],
+    key: str,
+    relation: str,
+    comparison: dict[str, Any],
+) -> None:
+    record[key] = relation
+    comparison_key = f"{key}_comparison"
+    record[comparison_key] = deepcopy(comparison)
+    evidence = record.setdefault("formatting_evidence", {})
+    if isinstance(evidence, dict):
+        evidence[key] = relation
+        evidence[comparison_key] = deepcopy(comparison)
+
+
+def _annotate_font_size_relations(
+    paragraphs: list[dict[str, Any]],
+    tables: list[dict[str, Any]],
+) -> None:
+    """Attach only evidence-backed table/body/note size relations."""
+
+    baseline, baseline_evidence = _baseline_size(paragraphs)
+    body_by_id = {str(record.get("id")): record for record in paragraphs}
+    for table in tables:
+        table_size, table_evidence = _table_size(table)
+        relation, comparison = _size_relation(
+            table_size,
+            baseline,
+            reason=(
+                baseline_evidence.get("reason")
+                if baseline is None
+                else table_evidence.get("reason")
+                if table_size is None
+                else None
+            ),
+        )
+        table["font_size_relation_to_body"] = relation
+        table["font_size_relation_to_body_comparison"] = deepcopy(comparison)
+        table["font_size_evidence"] = {
+            "body_baseline": deepcopy(baseline_evidence),
+            "table": deepcopy(table_evidence),
+        }
+        for cell in table.get("cells", []):
+            if not isinstance(cell, dict):
+                continue
+            for record in cell.get("paragraphs", []):
+                if not isinstance(record, dict) or not _record_text(record).strip():
+                    continue
+                if _note_marker_text(_record_text(record)):
+                    note_relation, note_comparison = _size_relation(
+                        _record_run_sizes(record)[0],
+                        table_size,
+                        reason=table_evidence.get("reason") if table_size is None else _record_run_sizes(record)[1],
+                        classify_one_cn_step=True,
+                    )
+                    _apply_size_relation(record, "font_size_relation_to_table", note_relation, note_comparison)
+                else:
+                    _apply_size_relation(record, "font_size_relation_to_body", relation, comparison)
+        for candidate in table.get("note_candidates", []):
+            if not isinstance(candidate, dict):
+                continue
+            paragraph_id = candidate.get("adjacent_body_paragraph_id") or candidate.get("paragraph_id")
+            body_record = body_by_id.get(str(paragraph_id))
+            if candidate.get("location") == "body" and body_record is not None:
+                note_size, note_status = _record_run_sizes(body_record)
+                note_relation, note_comparison = _size_relation(
+                    note_size,
+                    table_size,
+                    reason=table_evidence.get("reason") if table_size is None else note_status if note_size is None else None,
+                    classify_one_cn_step=True,
+                )
+                _apply_size_relation(body_record, "font_size_relation_to_table", note_relation, note_comparison)
+                candidate["formatting"] = deepcopy(body_record.get("formatting", {}))
+                candidate["effective_formatting"] = deepcopy(body_record.get("effective_formatting", {}))
+                candidate["formatting_evidence"] = deepcopy(body_record.get("formatting_evidence", {}))
+                candidate["runs"] = deepcopy(body_record.get("runs", []))
+            elif candidate.get("location") == "table_cell":
+                cell_record = next(
+                    (record for cell in table.get("cells", []) for record in cell.get("paragraphs", []) if isinstance(record, dict) and str(record.get("id")) == str(paragraph_id)),
+                    None,
+                )
+                if cell_record is not None:
+                    for key in ("font_size_relation_to_table", "font_size_relation_to_table_comparison", "formatting_evidence"):
+                        if key in cell_record:
+                            candidate[key] = deepcopy(cell_record[key])
 
 
 def _global_object_counts(package: DocxPackage, include_text: bool = False) -> dict[str, Any]:
@@ -587,18 +1121,33 @@ def _toc_membership(body_paragraphs: list[etree._Element], resolver: StyleResolv
     return flags
 
 
-def _add_body_metadata(paragraphs: list[dict[str, Any]], body_paragraphs: list[etree._Element]) -> None:
+def _add_body_metadata(
+    paragraphs: list[dict[str, Any]],
+    body_paragraphs: list[etree._Element],
+    body_blocks: list[dict[str, Any]] | None = None,
+) -> None:
     section_index = 0
+    body_order_by_id = {
+        str(block.get("id")): index
+        for index, block in enumerate(body_blocks or [])
+        if block.get("kind") == "paragraph"
+    }
     for body_order, paragraph in enumerate(body_paragraphs):
         if body_order >= len(paragraphs):
             break
-        paragraphs[body_order]["body_order"] = body_order
+        paragraph_id = str(paragraphs[body_order].get("id"))
+        paragraphs[body_order]["body_order"] = body_order_by_id.get(paragraph_id, body_order)
         paragraphs[body_order]["section_index"] = section_index
         if paragraph.find(f"{qname(W_NS, 'pPr')}/{qname(W_NS, 'sectPr')}") is not None:
             section_index += 1
 
 
-def inspect_docx(path: str | Path, include_text: bool = False) -> Inspection:
+def inspect_docx(
+    path: str | Path,
+    include_text: bool = False,
+    *,
+    include_metadata: bool = False,
+) -> Inspection:
     """Inspect a DOCX without modifying its bytes or metadata.
 
     Parameters
@@ -609,6 +1158,10 @@ def inspect_docx(path: str | Path, include_text: bool = False) -> Inspection:
     include_text:
         Include full paragraph/run text in addition to the default 80-character
         previews.  The default keeps reports suitable for sharing.
+    include_metadata:
+        Explicitly include core-property text.  This is separate from
+        ``include_text`` so requesting document text never opts a report into
+        personal metadata disclosure.
     """
     package = DocxPackage.open(path)
     source = package.path
@@ -617,7 +1170,8 @@ def inspect_docx(path: str | Path, include_text: bool = False) -> Inspection:
     except OSError as exc:
         raise DocxInspectionError(f"Could not read DOCX input: {source.name}", kind="io", path=source) from exc
     resolver = StyleResolver(package)
-    numbering = NumberingResolver(package)
+    numbering = NumberingResolver(package, resolver)
+    note_marker_properties = _note_marker_properties(package)
     body = package.document_root.find(qname(W_NS, "body"))
     if body is None:
         raise DocxInspectionError("DOCX core part has no document body", kind="core_part", path=source)
@@ -639,14 +1193,30 @@ def inspect_docx(path: str | Path, include_text: bool = False) -> Inspection:
             numbering,
             include_text,
             in_toc_context=paragraph_is_toc_context,
+            note_marker_properties=note_marker_properties,
         )
         paragraphs.append(paragraph_record)
-    _add_body_metadata(paragraphs, body_paragraphs)
+    table_ids = {id(element): f"table-{index:06d}" for index, element in enumerate(body_tables)}
+    paragraph_elements = {
+        paragraph_ids[id(element)]: element
+        for element in body_paragraphs
+    }
+    body_blocks = _body_blocks(body, paragraph_ids, table_ids)
+    _add_body_metadata(paragraphs, body_paragraphs, body_blocks)
 
     tables = [
         _inspect_table(table, index, resolver, numbering, include_text)
         for index, table in enumerate(body_tables)
     ]
+    table_order_by_id = {
+        str(block.get("id")): index
+        for index, block in enumerate(body_blocks)
+        if block.get("kind") == "table"
+    }
+    for table in tables:
+        table["body_order"] = table_order_by_id.get(str(table.get("id")))
+    _bind_adjacent_table_notes(tables, paragraphs, body_blocks, paragraph_elements)
+    _annotate_font_size_relations(paragraphs, tables)
     section_records = [
         _section_record(package, section, index)
         for index, section in enumerate(_section_elements(package.document_root))
@@ -656,12 +1226,17 @@ def inspect_docx(path: str | Path, include_text: bool = False) -> Inspection:
     paragraph_texts = {id(element): _visible_text(element) for element in body_paragraphs}
     images = inspect_images(package, paragraph_ids, paragraph_texts)
     notes = inspect_notes(package, include_text, resolver)
+    for kind in ("footnote", "endnote"):
+        note_key = f"{kind}s"
+        if note_key in notes:
+            notes[note_key]["marker_properties"] = deepcopy(note_marker_properties[kind])
     objects = _global_object_counts(package, include_text=include_text)
     reported_page_count = _core_page_count(package)
     summary = {
         "section_count": len(section_records),
         "paragraph_count": len(paragraphs),
         "table_count": len(tables),
+        "body_block_count": len(body_blocks),
         "image_count": len(images),
         "equation_count": equation_report["omath_count"],
         "omath_count": equation_report["omath_count"],
@@ -687,9 +1262,10 @@ def inspect_docx(path: str | Path, include_text: bool = False) -> Inspection:
             "size_bytes": len(raw_bytes),
             "reported_page_count": reported_page_count,
         },
-        "core_properties": _core_properties(package),
+        "core_properties": _core_properties(package, include_metadata=include_metadata),
         "summary": summary,
         "sections": section_records,
+        "body_blocks": body_blocks,
         "paragraphs": paragraphs,
         "tables": tables,
         "images": images,

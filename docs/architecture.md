@@ -9,6 +9,8 @@ Inspector        读取 OOXML、样式、字段、脚注、表图、段落
   ↓
 Classifier       为段落/对象赋予语义角色 + confidence
   ↓
+Citation model   parenthetical / narrative / unknown + span + confidence
+  ↓
 Rule Engine      加载 rules/*.yaml
   ↓
 Linter           7 类状态 + 逐目标 finding + capability summary
@@ -32,6 +34,18 @@ lint implementation
 
 Linter 执行前必须通过严格规则校验。非法规则根直接终止执行；被未决 conflict 引用的规则不进入确定性 handler，而是输出 `NOT_CHECKED`。
 
+## Profile 与分发
+
+```text
+rules/ + sources/normalized/source-index.yaml   # 人工维护源树
+                    ↕ byte-for-byte sync test
+src/economic_research_formatter/profiles/economic_research/
+                    ↓ importlib.resources
+installed wheel / console script
+```
+
+运行时从 package profile 加载规则，因此不依赖当前工作目录或仓库顶层路径。CI 在 Python 3.10–3.12 上执行 lint/test/validate/build，并在 checkout 外的临时 venv 运行 wheel smoke test。
+
 ## 当前模块
 
 ```text
@@ -49,8 +63,11 @@ cli.py
 ├── classify/                    # 确定性 heuristic + evidence
 ├── lint/                        # manuscript/citation/reference handlers
 ├── models/                      # inspection/audit/rule validation models
+├── profiles/                    # bundled journal profile data
 └── report/                      # 确定性 JSON 和中文 Markdown
 ```
+
+Inspector 另输出统一 `body_blocks`，保留 paragraph/table 的真实 OOXML 顺序。表后第一个非空 `注：` 段只在无标题/新表/新图阻断时绑定，并保留 table ID、paragraph ID、距离和原因。表格/正文/表注相对字号由 effective run formatting 计算；混合或缺失证据为 unknown。
 
 ## 双视图隐私边界
 

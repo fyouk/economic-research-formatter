@@ -25,6 +25,7 @@ audit.md
     "reported_page_count": 0
   },
   "summary": {},
+  "body_blocks": [],
   "sections": [],
   "paragraphs": [],
   "tables": [],
@@ -42,9 +43,13 @@ audit.md
 
 `reported_page_count` 来自 Word 文档属性，不是当前环境实时渲染的权威页数。
 
+`body_blocks` 以稳定 ID 保留顶层 paragraph/table 的真实文档顺序，用于表注绑定和跨对象上下文。
+
 段落使用稳定 ID，例如 `p-000017`。默认只有 `text_preview`，最多 80 字；显式使用 `--include-text` 后才增加 `text`。Run 记录文本范围、direct formatting、effective formatting、resolution source 和解析链。
 
 表格 cell 的段落只出现在 `tables` 中，不会重复加入 body `paragraphs`。TOC 显示段落保留稳定 ID 并标记 `in_toc: true`。
+
+`core_properties` 默认不保存姓名或标题等明文；creator/last-modified-by 仅记录 presence + SHA-256，其他文本属性默认省略。只有显式 `--include-metadata` 才保留明文，`--include-text` 不会隐式开启该能力。
 
 ## audit.json
 
@@ -104,6 +109,8 @@ audit.md
 ```
 
 `expected` 直接来自当前 `rules/*.yaml` 的 `requirement`。Linter 不在代码中维护第二套字体、字号、连接符或横线要求。
+
+引文 finding 的 `observed.candidate` 可包含 `kind` (`parenthetical` / `narrative` / `unknown`)、paragraph ID、span、authors、year、page、最多 80 字的 preview 与 confidence。合法 narrative citation 的作者在正文，括号内只保留年份/必要页码。
 
 ## 状态
 
