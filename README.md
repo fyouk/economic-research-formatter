@@ -1,20 +1,20 @@
 # economic-research-formatter
 
-面向《经济研究》投稿论文的 **DOCX 格式检查与安全格式化工具**。
+面向《经济研究》投稿论文的 **DOCX 只读结构检查与格式审计工具**。
 
-当前阶段的目标不是“让 Agent 读完规范后自由发挥”，而是把现有规范材料编译为：
+当前阶段将现有规范材料编译为可追溯资产和确定性程序，避免依赖临时提示或主观补全：
 
 1. 可追溯的原始来源（`sources/raw/`）
 2. 机器可读的原子规则（`rules/`）
 3. 冲突与未知项登记（`rules/conflicts.yaml`、`rules/unresolved.yaml`）
-4. Agent 执行工作流（`SKILL.md`）
-5. 后续 DOCX Linter / Formatter 的代码骨架（`src/`）
+4. 可复用工作流说明（`SKILL.md`）
+5. DOCX Inspector / Linter 的可追溯实现（`src/`）
 
 > **核心原则**：工具只能执行来源材料明确支持的规则。未规定、仅由示例推断、或来源之间存在冲突的项目，不得静默补全为“《经济研究》要求”。
 
 ## 当前状态
 
-**Milestone 1 / Source normalization + Rule specification（进行中）**
+**Milestone 2–3 / Strict rules + Read-only Inspector/Linter v1（已实现）**
 
 已经完成第一轮：
 
@@ -25,16 +25,25 @@
 - 文后参考文献规则拆分
 - 冲突登记
 - 未规定项目登记
-- 最小规则加载/校验 CLI
+- 严格规则结构、引用与跨文件校验
+- Lint 执行前的严格规则门禁与未决冲突隔离
+- DOCX/OOXML 只读结构扫描
+- 统一 body block 顺序、相邻表注绑定与真实相对字号证据
+- 确定性语义分类
+- parenthetical / narrative / unknown 引文候选模型与脚注引文检查
+- Manuscript / Citation / Reference Linter v1
+- 确定性 JSON 和中文 Markdown 审计报告
+- ZIP/XML/图像资源上限与默认隐私脱敏
+- 合成测试与可选私有样本集成测试
 
 尚未实现：
 
-- DOCX 结构识别
 - Word 样式应用
-- 引用字段保护
 - 自动修复
 - 页面渲染验收
 - CSL 生成/适配
+
+> 当前版本不会修改 DOCX，也不提供 `fix` 命令。
 
 ## 目录
 
@@ -55,21 +64,33 @@ economic-research-formatter/
 │   └── unresolved.yaml       # 当前资料未规定或无法确定的项目
 ├── docs/
 │   ├── architecture.md
+│   ├── audit-schema.md
+│   ├── limitations.md
+│   ├── private-fixture.md
 │   ├── source-priority.md
 │   └── rule-authoring-guide.md
 ├── src/economic_research_formatter/
-│   ├── __init__.py
+│   ├── docx/                 # OOXML Inspector
+│   ├── classify/             # 确定性语义分类
+│   ├── lint/                 # 规则执行
+│   ├── models/               # 稳定输出模型
+│   ├── profiles/             # wheel 内置规则 profile
+│   ├── report/               # JSON / Markdown
 │   ├── cli.py
 │   └── rule_loader.py
 └── tests/
-    └── rules/
+    ├── rules/
+    ├── inspector/
+    ├── classifier/
+    ├── linter/
+    └── integration/
 ```
 
 ## 设计原则
 
 ### 1. Source of truth 是来源 + 规则，不是 Prompt
 
-`SKILL.md` 只负责规定 Agent 的操作顺序。具体格式值必须来自 `rules/*.yaml`，而 `rules/*.yaml` 必须能追溯到 `sources/raw/`。
+`SKILL.md` 只描述操作顺序。具体格式值必须来自 `rules/*.yaml`，而 `rules/*.yaml` 必须能追溯到 `sources/raw/`。
 
 ### 2. 红色批注是明确来源标签，不只是视觉颜色
 
@@ -98,7 +119,98 @@ unknown         当前来源未规定
 
 而不是立即修改全部内容。
 
-自动修复只允许作用于 `autofix: safe` 或满足条件后的 `autofix: conditional` 规则。
+规则文件为后续 Safe Formatter 保留 `autofix` 元数据，但当前版本不执行任何自动修复。
+
+## 安装
+
+Python 要求：`>=3.10`。
+
+从完整源码树安装（pip 会先构建 wheel）：
+
+```bash
+python -m pip install .
+```
+
+本地开发：
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -e '.[dev]'
+python -m build
+```
+
+wheel 内包含《经济研究》profile，console script 可在仓库 checkout 之外运行。顶层 `rules/` 是便于人工维护的源树，测试会逐字节验证它与 package profile 同步。
+
+## CLI
+
+### 校验规则
+
+```bash
+er-format validate-rules
+er-format validate-rules --json
+```
+
+### 只读扫描 DOCX
+
+```bash
+er-format inspect INPUT.docx --output inspection.json
+```
+
+默认只保存最多 80 字的文本预览。只有当输出确实可以保留全文时才使用：
+
+```bash
+er-format inspect INPUT.docx --output inspection.json --include-text
+```
+
+Word 核心属性默认脱敏，`--include-text` 不会同时授权元数据。确需保留明文属性时单独使用：
+
+```bash
+er-format inspect INPUT.docx --output inspection.json --include-metadata
+```
+
+### 执行格式审计
+
+```bash
+er-format lint INPUT.docx --output-dir reports/audit
+```
+
+输出：
+
+```text
+reports/audit/inspection.json
+reports/audit/audit.json
+reports/audit/audit.md
+```
+
+`lint` 会在内存中读取全文以识别文内引用，但默认写出的 `inspection.json` 仍仅包含截断预览。如果审计发现 `ERROR`，命令返回 1；执行失败返回 2。探索性审计可使用 `--exit-zero`。
+
+Latin-font v1 覆盖 body paragraph、table cell paragraph、footnote paragraph 和 endnote paragraph。Header/footer 内部文本、text box/drawing text 与 embedded chart 尚未进入该规则的字符级检查。
+
+## 结果状态
+
+| 状态 | 含义 |
+| --- | --- |
+| `PASS` | 目标存在且已确定满足规则 |
+| `ERROR` | 目标确定违反 mandatory 规则 |
+| `WARNING` | 目标违反 recommended 规则 |
+| `INFO` | 可追溯的观察信息 |
+| `MANUAL_REVIEW` | 存在目标，但冲突、语义或能力边界阻止安全自动判断 |
+| `NOT_CHECKED` | 尚未实现，或 unresolved/conflict 禁止自动裁决 |
+| `NOT_APPLICABLE` | 文档中不存在该类目标 |
+
+`NOT_APPLICABLE` 不等于 `PASS`，`NOT_CHECKED` 也不会伪装成已检查。
+
+## 私有文档
+
+本地私有集成测试通过环境变量定位：
+
+```bash
+export ER_PRIVATE_FIXTURE='/absolute/path/private-manuscript.docx'
+python -m pytest -q tests/integration/test_private_fixture.py
+```
+
+私有 DOCX、完整私有审计报告和本机绝对路径均不应进入公开仓库。详见 [`docs/private-fixture.md`](docs/private-fixture.md)。
 
 ## 计划
 
@@ -109,14 +221,15 @@ unknown         当前来源未规定
 
 ### M2 — Rule specification
 - [x] 第一轮拆分 manuscript / citation / reference rules
-- [ ] 对每条规则做逐条人工复核
-- [ ] 建立规则单元测试
+- [x] 建立严格结构、引用和跨文件校验
+- [x] 建立规则正向/负向单元测试
+- [ ] 对每条来源规则做逐条人工内容复核
 
 ### M3 — DOCX linter
-- [ ] DOCX 结构扫描
-- [ ] 语义角色识别
-- [ ] 字体、字号、段落、脚注、图表与参考文献检查
-- [ ] 输出可定位的审计报告
+- [x] DOCX 结构扫描
+- [x] 语义角色识别
+- [x] 字体、字号、段落、脚注、图表与参考文献检查 v1
+- [x] 输出可定位的 JSON + Markdown 审计报告
 
 ### M4 — Safe formatter
 - [ ] 低风险格式自动修复
@@ -128,14 +241,13 @@ unknown         当前来源未规定
 - [ ] 文内—文后一致性检查
 - [ ] CSL 或确定性格式器
 
-## 本地验证规则文件
+## 开发验证
 
 ```bash
+ruff check src tests scripts
+python -m pytest -q
+python -m pytest --cov=economic_research_formatter --cov-report=term-missing
 python -m economic_research_formatter.cli validate-rules
-```
-
-开发安装：
-
-```bash
-pip install -e .
+python -m build
+python scripts/wheel_smoke.py dist/*.whl
 ```

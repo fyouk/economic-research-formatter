@@ -1,0 +1,50 @@
+version: 1
+conflicts:
+  - id: ER-CONFLICT-001
+    topic: english_reference_title_capitalization
+    status: unresolved_overlap
+    source_a:
+      rule_id: ER-MS-REF-TITLECASE-001
+      statement: "参考文献中题目的首字母大写"
+    source_b:
+      rule_id: ER-REF-FOREIGN-TITLE-001
+      statement: "每个实词应首字母大写"
+    analysis: >-
+      两条要求可能是“较弱要求 + 更具体要求”，也可能反映不同版本/编辑习惯。
+      当前材料没有提供版本日期，不能静默认定其中一条覆盖另一条。
+    execution:
+      lint: manual_review
+      autofix: never
+
+  - id: ER-CONFLICT-002
+    topic: english_reference_author_order_and_initial_position
+    status: unresolved
+    source_a:
+      rule_id: ER-MS-REF-AUTHOR-001
+      statement: "姓全写，名缩写，且第1、第2、第3作者的名缩写放置位置"
+    source_b:
+      rule_id: ER-REF-FOREIGN-AUTHOR-001
+      statement: "姓在前，并用逗号与后面的名隔开"
+    analysis: >-
+      稿件红色批注明确暗示不同作者位置的缩写放置方式有区别；另一份说明以统一的“姓在前”表达。
+      在没有更完整示例或版本信息前，不自动重排多作者英文参考文献。
+    execution:
+      lint: manual_review
+      autofix: never
+
+  - id: ER-CONFLICT-003
+    topic: page_range_separator_in_foreign_reference
+    status: source_example_vs_explicit_annotation
+    source_a:
+      rule_id: ER-MS-REF-PAGERANGE-001
+      statement: "页面范围使用长横线（—）"
+    source_b:
+      source_id: ER-REF-GUIDE
+      statement: "外文文献示例出现 PP15-25"
+    analysis: >-
+      source_b 是示例中的连字符写法，不是正文明确宣布的横线规范；source_a 是明确红色批注。
+      当前规则层保留 source_a 为可执行规则，同时记录示例差异，避免丢失来源事实。
+    execution:
+      lint: info
+      autofix: safe
+      effective_rule: ER-MS-REF-PAGERANGE-001

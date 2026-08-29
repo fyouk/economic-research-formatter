@@ -1,0 +1,166 @@
+version: 1
+rules:
+  - id: ER-REF-ORDER-FIELDS-001
+    domain: reference
+    target: reference_entry_field_order
+    normativity: mandatory
+    source:
+      source_id: ER-REF-GUIDE
+      source_type: explicit_instruction
+      locator: "二/（一）基本方法"
+      evidence: "作者；出版年份；文献名；出版者或刊物名称；第x卷或期号；第xx—xx页"
+    requirement:
+      field_order: [authors, year, title, publication_or_publisher, volume_or_issue, pages]
+    lint: {severity: error}
+    autofix: never
+
+  - id: ER-REF-SORT-001
+    domain: reference
+    target: reference_sort_order
+    normativity: mandatory
+    source:
+      source_id: ER-REF-GUIDE
+      source_type: explicit_instruction
+      locator: "二/（一）/（1）"
+      evidence: "按姓氏拼音的第一个拉丁字母排序"
+    requirement:
+      primary_key: author_surname_initial_latin
+    lint: {severity: error}
+    autofix: conditional
+
+  - id: ER-REF-SAMEYEAR-001
+    domain: reference
+    target: same_author_same_year
+    normativity: mandatory
+    source:
+      source_id: ER-REF-GUIDE
+      source_type: explicit_instruction
+      locator: "二/（一）/（2）"
+      evidence: "在年份后加注字母a,b,c等"
+    requirement:
+      suffix_sequence: [a, b, c]
+    lint: {severity: error}
+    autofix: conditional
+
+  - id: ER-REF-TRANSLATION-001
+    domain: reference
+    target: translated_reference
+    normativity: mandatory
+    source:
+      source_id: ER-REF-GUIDE
+      source_type: explicit_instruction
+      locator: "二/（二）"
+      evidence: "以作者的中文译名打头；出版年份仅注所引文献中译本的出版年份"
+    requirement:
+      author_form: chinese_translated_name
+      year_basis: cited_chinese_translation_edition
+      title_language: chinese
+      translation_marker_optional: 中译本
+    lint: {severity: error}
+    autofix: never
+
+  - id: ER-REF-FOREIGN-AUTHOR-001
+    domain: reference
+    target: foreign_reference_author
+    normativity: mandatory
+    source:
+      source_id: ER-REF-GUIDE
+      source_type: explicit_instruction
+      locator: "二/（三）/（2）"
+      evidence: "姓在前，并用逗号与后面的名隔开；名用缩写时，必须用实心点标明"
+    requirement:
+      surname_first: true
+      comma_after_surname: true
+      initials_require_period: true
+      initial_capitalization: true
+    lint: {severity: error}
+    autofix: never
+
+  - id: ER-REF-FOREIGN-TITLE-001
+    domain: reference
+    target: foreign_reference_title
+    normativity: mandatory
+    source:
+      source_id: ER-REF-GUIDE
+      source_type: explicit_instruction
+      locator: "二/（三）/（4）"
+      evidence: "每个实词应首字母大写"
+    requirement:
+      capitalization: content_words_initial_uppercase
+    lint: {severity: manual_review}
+    autofix: never
+
+  - id: ER-REF-FOREIGN-ARTICLE-QUOTE-001
+    domain: reference
+    target: foreign_article_title
+    normativity: mandatory
+    source:
+      source_id: ER-REF-GUIDE
+      source_type: explicit_instruction
+      locator: "二/（三）/（4）"
+      evidence: "如果所引文献是文章，必须用双引号括起来，如果是书籍，不用引号"
+    requirement:
+      article_quotes: double
+      book_quotes: none
+    lint: {severity: error}
+    autofix: conditional
+
+  - id: ER-REF-FOREIGN-PUBLICATION-001
+    domain: reference
+    target: foreign_journal_or_publisher
+    normativity: mandatory
+    source:
+      source_id: ER-REF-GUIDE
+      source_type: explicit_instruction
+      locator: "二/（三）/（5）"
+      evidence: "如果是杂志，用斜体表示；如果是出版社，保持正体"
+    requirement:
+      journal_italic: true
+      publisher_italic: false
+    lint: {severity: error}
+    autofix: conditional
+
+  - id: ER-REF-FOREIGN-LINE-001
+    domain: reference
+    target: foreign_reference_entry_layout
+    normativity: mandatory
+    source:
+      source_id: ER-REF-GUIDE
+      source_type: explicit_instruction
+      locator: "二/（三）/（7）"
+      evidence: "以上各项在同一行连续排列，中间用逗号隔开"
+    requirement:
+      single_continuous_paragraph: true
+      field_separator: comma
+    lint: {severity: error}
+    autofix: conditional
+
+  - id: ER-REF-LANGUAGE-GROUP-001
+    domain: reference
+    target: reference_language_grouping
+    normativity: mandatory
+    source:
+      source_id: ER-REF-GUIDE
+      source_type: explicit_instruction
+      locator: "二/（四）"
+      evidence: "中文文献全部排在外文文献之前"
+    requirement:
+      group_order: [chinese_including_translations, foreign]
+      sort_each_group_separately: true
+      sort_key: author_surname_initial_latin
+    lint: {severity: error}
+    autofix: conditional
+
+  - id: ER-REF-CONTENT-FOOTNOTE-001
+    domain: reference
+    target: literature_citation_inside_content_footnote
+    normativity: mandatory
+    source:
+      source_id: ER-REF-GUIDE
+      source_type: explicit_instruction
+      locator: "三/关于其他注释"
+      evidence: "内容注释当中所涉及的文献，按正文中同样的文献注释方法加注"
+    requirement:
+      reuse_in_text_citation_rules: true
+    lint: {severity: error}
+    autofix: never

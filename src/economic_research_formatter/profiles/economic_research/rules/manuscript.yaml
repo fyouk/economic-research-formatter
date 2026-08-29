@@ -1,0 +1,349 @@
+version: 1
+rules:
+  - id: ER-MS-TITLE-001
+    domain: manuscript
+    target: title
+    normativity: mandatory
+    source:
+      source_id: ER-MS-IMG-NOTES
+      source_type: red_annotation
+      locator: "附录/图片第1页/批注1"
+      evidence: "标题：宋体三或小三，居中。"
+    requirement:
+      east_asia_font: 宋体
+      font_size_allowed_cn: [三号, 小三号]
+      alignment: center
+    lint: {severity: error}
+    autofix: conditional
+
+  - id: ER-MS-TITLE-002
+    domain: manuscript
+    target: title_author_info_marker
+    normativity: mandatory
+    source:
+      source_id: ER-MS-IMG-NOTES
+      source_type: red_annotation
+      locator: "附录/图片第1页/批注1"
+      evidence: "作者信息用*脚注表示。"
+    requirement:
+      marker: "*"
+      mechanism: footnote
+    lint: {severity: error}
+    autofix: never
+
+  - id: ER-MS-AUTHOR-001
+    domain: manuscript
+    target: author_name
+    normativity: mandatory
+    source:
+      source_id: ER-MS-IMG-NOTES
+      source_type: red_annotation
+      locator: "附录/图片第1页/批注2"
+      evidence: "作者姓名宋体小四号，居中"
+    requirement:
+      east_asia_font: 宋体
+      font_size_cn: 小四号
+      alignment: center
+    lint: {severity: error}
+    autofix: conditional
+
+  - id: ER-MS-AUTHORINFO-001
+    domain: manuscript
+    target: author_information_footnote
+    normativity: recommended
+    source:
+      source_id: ER-MS-IMG-NOTES
+      source_type: red_annotation
+      locator: "附录/图片第1页/批注1"
+      evidence: "一般6号宋体"
+    requirement:
+      east_asia_font: 宋体
+      font_size_cn: 六号
+    lint: {severity: warning}
+    autofix: conditional
+
+  - id: ER-MS-AUTHORINFO-002
+    domain: manuscript
+    target: contact_label
+    normativity: mandatory
+    source:
+      source_id: ER-MS-IMG-NOTES
+      source_type: red_annotation
+      locator: "附录/图片第1页/批注7"
+      evidence: "电子信箱，而非电子邮箱"
+    requirement:
+      preferred_term: 电子信箱
+      disallowed_term: 电子邮箱
+    lint: {severity: error}
+    autofix: safe
+
+  - id: ER-MS-ABSTRACT-001
+    domain: manuscript
+    target: abstract
+    normativity: mandatory
+    source:
+      source_id: ER-MS-IMG-NOTES
+      source_type: red_annotation
+      locator: "附录/图片第1页/批注3"
+      evidence: "仿宋5号"
+    requirement:
+      east_asia_font: 仿宋
+      font_size_cn: 五号
+    lint: {severity: error}
+    autofix: conditional
+
+  - id: ER-MS-HEADING1-001
+    domain: manuscript
+    target: heading_level_1
+    normativity: mandatory
+    source:
+      source_id: ER-MS-IMG-NOTES
+      source_type: red_annotation
+      locator: "附录/图片第1页/批注4"
+      evidence: "宋体四号，居中"
+    requirement:
+      east_asia_font: 宋体
+      font_size_cn: 四号
+      alignment: center
+    lint: {severity: error}
+    autofix: conditional
+
+  - id: ER-MS-HEADING-HIERARCHY-001
+    domain: manuscript
+    target: heading_numbering
+    normativity: mandatory
+    source:
+      source_id: ER-MS-IMG-NOTES
+      source_type: red_annotation
+      locator: "附录/图片第1页/批注6"
+      evidence: "前面空2格，请用（一）标序，下级依次用1.（1）"
+    requirement:
+      level_2:
+        prefix_pattern: "（一）"
+        leading_spaces_cn: 2
+      lower_levels:
+        sequence: ["1.", "（1）"]
+    lint: {severity: error}
+    autofix: conditional
+
+  - id: ER-MS-EQUATION-001
+    domain: manuscript
+    target: equation
+    normativity: mandatory
+    source:
+      source_id: ER-MS-IMG-NOTES
+      source_type: red_annotation
+      locator: "附录/图片第1页末—第2页顶端/批注8"
+      evidence: "数学公式的写法用 word 自带，或 mathtype 编辑"
+    requirement:
+      allowed_editors: [Word Equation, MathType]
+    lint: {severity: manual_review}
+    autofix: never
+
+  - id: ER-MS-EQUATION-002
+    domain: manuscript
+    target: equation_where_paragraph
+    normativity: mandatory
+    source:
+      source_id: ER-MS-IMG-NOTES
+      source_type: red_annotation
+      locator: "附录/图片第1页末—第2页顶端/批注8"
+      evidence: "‘其中’前空两格"
+    requirement:
+      trigger_text: 其中
+      leading_spaces_cn: 2
+    lint: {severity: error}
+    autofix: conditional
+
+  - id: ER-MS-TABLE-001
+    domain: manuscript
+    target: table_text
+    normativity: recommended
+    source:
+      source_id: ER-MS-IMG-NOTES
+      source_type: red_annotation
+      locator: "附录/图片第2页/批注9"
+      evidence: "表格格式，建议仿宋体，字号比正文小"
+    requirement:
+      east_asia_font: 仿宋
+      font_size_relation_to_body: smaller
+    lint: {severity: warning}
+    autofix: conditional
+
+  - id: ER-MS-TABLE-NOTE-001
+    domain: manuscript
+    target: table_note
+    normativity: mandatory
+    source:
+      source_id: ER-MS-IMG-NOTES
+      source_type: red_annotation
+      locator: "附录/图片第2页/批注9"
+      evidence: "注释内容字体比表格字体小1号"
+    requirement:
+      font_size_relation_to_table: one_cn_size_smaller
+    lint: {severity: error}
+    autofix: conditional
+
+  - id: ER-MS-TABLE-NOTE-002
+    domain: manuscript
+    target: table_note
+    normativity: recommended
+    source:
+      source_id: ER-MS-IMG-NOTES
+      source_type: red_annotation
+      locator: "附录/图片第2页/批注9"
+      evidence: "建议宋体"
+    requirement:
+      east_asia_font: 宋体
+    lint: {severity: warning}
+    autofix: conditional
+
+  - id: ER-MS-FOOTNOTE-001
+    domain: manuscript
+    target: ordinary_footnote_numbering
+    normativity: mandatory
+    source:
+      source_id: ER-MS-IMG-NOTES
+      source_type: red_annotation
+      locator: "附录/图片第2页/批注10"
+      evidence: "脚注每页重新编号"
+    requirement:
+      restart: each_page
+    lint: {severity: error}
+    autofix: conditional
+
+  - id: ER-MS-FOOTNOTE-002
+    domain: manuscript
+    target: ordinary_footnote_text
+    normativity: mandatory
+    source:
+      source_id: ER-MS-IMG-NOTES
+      source_type: red_annotation
+      locator: "附录/图片第2页/批注10"
+      evidence: "脚注内容前空2格，宋体六号"
+    requirement:
+      leading_spaces_cn: 2
+      east_asia_font: 宋体
+      font_size_cn: 六号
+    lint: {severity: error}
+    autofix: conditional
+
+  - id: ER-MS-FIGURE-001
+    domain: manuscript
+    target: figure_caption
+    normativity: mandatory
+    source:
+      source_id: ER-MS-IMG-NOTES
+      source_type: red_annotation
+      locator: "附录/图片第3页/批注11"
+      evidence: "图标题用黑体小五，居中"
+    requirement:
+      east_asia_font: 黑体
+      font_size_cn: 小五号
+      alignment: center
+    lint: {severity: error}
+    autofix: conditional
+
+  - id: ER-MS-FIGURE-002
+    domain: manuscript
+    target: figure
+    normativity: mandatory
+    source:
+      source_id: ER-MS-IMG-NOTES
+      source_type: red_annotation
+      locator: "附录/图片第3页/批注11"
+      evidence: "黑白图"
+    requirement:
+      color_mode: black_and_white
+    lint: {severity: manual_review}
+    autofix: never
+
+  - id: ER-MS-REF-LAYOUT-001
+    domain: manuscript
+    target: reference_entry
+    normativity: mandatory
+    source:
+      source_id: ER-MS-IMG-NOTES
+      source_type: red_annotation
+      locator: "附录/图片第3页/批注12.1"
+      evidence: "参考文献，宋体6号，参考文献不标序号，每一文献前空2格"
+    requirement:
+      east_asia_font: 宋体
+      font_size_cn: 六号
+      numbered: false
+      leading_spaces_cn: 2
+    lint: {severity: error}
+    autofix: conditional
+
+  - id: ER-MS-LATIN-FONT-001
+    domain: manuscript
+    target: latin_letters_and_digits
+    normativity: mandatory
+    source:
+      source_id: ER-MS-IMG-NOTES
+      source_type: red_annotation
+      locator: "附录/图片第3页/批注12.1"
+      evidence: "文稿中的英文字母和数字都用 times new roman 字体"
+    requirement:
+      ascii_font: Times New Roman
+      hansi_font: Times New Roman
+    lint: {severity: error}
+    autofix: conditional
+
+  - id: ER-MS-REF-PAGERANGE-001
+    domain: manuscript
+    target: reference_page_range
+    normativity: mandatory
+    source:
+      source_id: ER-MS-IMG-NOTES
+      source_type: red_annotation
+      locator: "附录/图片第3页/批注12.2"
+      evidence: "页面范围：破折号的一半，长横线"
+    requirement:
+      separator: "—"
+    lint: {severity: error}
+    autofix: safe
+
+  - id: ER-MS-REF-TITLECASE-001
+    domain: manuscript
+    target: english_reference_title
+    normativity: mandatory
+    source:
+      source_id: ER-MS-IMG-NOTES
+      source_type: red_annotation
+      locator: "附录/图片第3页/批注12.3"
+      evidence: "注意参考文献中题目的首字母大写"
+    requirement:
+      first_letter_uppercase: true
+    lint: {severity: manual_review}
+    autofix: never
+
+  - id: ER-MS-REF-AUTHOR-001
+    domain: manuscript
+    target: english_reference_authors
+    normativity: mandatory
+    source:
+      source_id: ER-MS-IMG-NOTES
+      source_type: red_annotation
+      locator: "附录/图片第3页/批注12.4"
+      evidence: "姓全写，名缩写，且第1、第2、第3作者的名缩写放置位置"
+    requirement:
+      surname_full: true
+      given_names_initials: true
+      author_position_sensitive: true
+    lint: {severity: manual_review}
+    autofix: never
+
+  - id: ER-MS-REF-JOURNAL-001
+    domain: manuscript
+    target: english_reference_journal_name
+    normativity: mandatory
+    source:
+      source_id: ER-MS-IMG-NOTES
+      source_type: red_annotation
+      locator: "附录/图片第3页/批注12.5"
+      evidence: "期刊名称是斜体"
+    requirement:
+      italic: true
+    lint: {severity: error}
+    autofix: conditional
